@@ -1,0 +1,24 @@
+[package]
+name = "peerless-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+peerless-compute = { path = "../peerless-compute" }
+peerless-core = { path = "../peerless-core" }
+peerless-identity = { path = "../peerless-identity" }
+libp2p.workspace = true
+peerless-network = { path = "../peerless-network" }
+peerless-protocol = { path = "../peerless-protocol" }
+peerless-storage = { path = "../peerless-storage" }
+peerless-state = { path = "../peerless-state" }
+peerless-ledger = { path = "../peerless-ledger" }
+thiserror.workspace = true
+sysinfo.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "peerless-double-example"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "double"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+
+[workspace]

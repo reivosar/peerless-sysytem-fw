@@ -1,0 +1,61 @@
+services:
+  dev:
+    build:
+      context: .
+      target: development
+    working_dir: /workspace
+    command: cargo test --workspace
+    volumes:
+      - .:/workspace
+      - peerless-cargo:/cargo
+      - peerless-target:/target
+    networks: [peerless]
+
+  node-a:
+    build:
+      context: .
+      target: development
+    working_dir: /workspace
+    command: cargo run -p peerless-cli -- start /data /ip4/0.0.0.0/udp/9718/quic-v1
+    volumes:
+      - .:/workspace:ro
+      - peerless-cargo:/cargo
+      - peerless-target:/target
+      - node-a-data:/data
+    networks: [peerless]
+
+  node-b:
+    build:
+      context: .
+      target: development
+    working_dir: /workspace
+    command: cargo run -p peerless-cli -- start /data /ip4/0.0.0.0/udp/9718/quic-v1
+    volumes:
+      - .:/workspace:ro
+      - peerless-cargo:/cargo
+      - peerless-target:/target
+      - node-b-data:/data
+    networks: [peerless]
+
+  node-c:
+    build:
+      context: .
+      target: development
+    working_dir: /workspace
+    command: cargo run -p peerless-cli -- start /data /ip4/0.0.0.0/udp/9718/quic-v1
+    volumes:
+      - .:/workspace:ro
+      - peerless-cargo:/cargo
+      - peerless-target:/target
+      - node-c-data:/data
+    networks: [peerless]
+
+networks:
+  peerless: {}
+
+volumes:
+  peerless-cargo: {}
+  peerless-target: {}
+  node-a-data: {}
+  node-b-data: {}
+  node-c-data: {}

@@ -1,0 +1,13 @@
+[package]
+name = "peerless-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+peerless-core = { path = "../peerless-core" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

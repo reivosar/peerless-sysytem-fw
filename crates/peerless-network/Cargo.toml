@@ -1,0 +1,21 @@
+[package]
+name = "peerless-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+peerless-protocol = { path = "../peerless-protocol" }
+futures.workspace = true
+libp2p.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+peerless-core = { path = "../peerless-core" }
+peerless-identity = { path = "../peerless-identity" }
+tempfile.workspace = true
