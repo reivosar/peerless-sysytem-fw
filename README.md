@@ -339,6 +339,40 @@ perfectly consistent global view.
 
 ## Validation
 
+### Full application E2E
+
+Run the reproducible application-level gate from the repository root:
+
+~~~sh
+./scripts/e2e.sh
+~~~
+
+The script creates a unique Docker Compose project with clean Cargo, build, and
+node-data volumes. It then:
+
+1. starts three independent node containers with distinct persistent identities;
+2. starts a fourth requester container and discovers executors through mDNS;
+3. transfers a real WASM module and input over libp2p QUIC;
+4. verifies the signed remote result is `42` and inspects executor CAS, Task, and Ledger state;
+5. stops the selected executor and proves a different live peer executes the next request;
+6. restarts the first executor and proves its Task and Ledger survive restart;
+7. stops the application nodes to isolate the adversarial suite;
+8. runs every workspace test, including CRDT, membership, replication repair,
+   BFT, tampering, AutoNAT, Relay v2, DCUtR, resource limits, and restart replay;
+9. compiles the browser transports for `wasm32-unknown-unknown`; and
+10. removes only the dedicated E2E containers, network, and volumes.
+
+The final line must be:
+
+~~~text
+result=PASS p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true adversarial=true browser=true
+~~~
+
+The concise execution trace is written to `e2e-output/latest.txt`. A failed
+assertion terminates the script with a non-zero status and never prints PASS.
+
+### Individual quality gates
+
 ~~~sh
 docker compose run --rm dev sh -c \\
   'cargo fmt --all -- --check && \\

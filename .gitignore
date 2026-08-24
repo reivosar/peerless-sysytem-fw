@@ -4,3 +4,4 @@ peerless-data/
 .peerless-build-dir
 .DS_Store
 demo-output/
+e2e-output/
