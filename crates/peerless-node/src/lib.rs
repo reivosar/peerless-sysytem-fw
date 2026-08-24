@@ -392,6 +392,13 @@ impl PeerlessNode {
     pub fn state(&self, name: &str) -> Result<StateDocument, NodeError> {
         Ok(self.inner.state.document(name)?)
     }
+    /// Imports a CRDT snapshot into the named local document. If the document
+    /// does not exist, the snapshot becomes its common history; otherwise it is
+    /// merged with the local history.
+    pub fn merge_state_snapshot(&self, name: &str, snapshot: &[u8]) -> Result<(), NodeError> {
+        self.inner.state.merge_snapshot(name, snapshot)?;
+        Ok(())
+    }
     pub fn publish_state(
         &self,
         network: &P2pRpc,

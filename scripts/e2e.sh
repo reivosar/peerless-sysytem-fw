@@ -110,8 +110,14 @@ record "restart-persistence service=$first_service $tasks_after $ledger_after"
 record 'phase=isolation action=stop-e2e-nodes-before-adversarial-tests'
 "${compose[@]}" stop node-a node-b node-c
 
+record 'phase=public-api action=full-feature-scenario'
+features_output="$("${compose[@]}" run --rm dev cargo run -p peerless-cli -- \
+  e2e-features /tmp/peerless-e2e-features)"
+printf '%s\n' "$features_output" | tee -a "$evidence"
+grep -q 'result=PASS content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true' <<<"$features_output"
+
 record 'phase=adversarial action=workspace-tests'
 "${compose[@]}" run --rm dev cargo test --workspace -- --test-threads=1
 "${compose[@]}" run --rm dev cargo check -p peerless-browser --target wasm32-unknown-unknown
 
-record 'result=PASS p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true adversarial=true browser=true'
+record 'result=PASS p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true'

@@ -331,6 +331,7 @@ peerless peers [DATA]
 peerless status [DATA]
 peerless inspect peers|tasks|storage|ledger [DATA]
 peerless run DATA WASM INTEGER [QUIC_MULTIADDR/p2p/PEER_ID ...]
+peerless e2e-features [DATA]
 peerless demo-images [DATA] [COUNT]
 ~~~
 
@@ -356,16 +357,20 @@ node-data volumes. It then:
 4. verifies the signed remote result is `42` and inspects executor CAS, Task, and Ledger state;
 5. stops the selected executor and proves a different live peer executes the next request;
 6. restarts the first executor and proves its Task and Ledger survive restart;
-7. stops the application nodes to isolate the adversarial suite;
-8. runs every workspace test, including CRDT, membership, replication repair,
+7. stops the application nodes to isolate the remaining network scenarios;
+8. runs the public application APIs over real sockets for DHT content fetch,
+   signed CRDT convergence, membership rejection, replica repair, 3-of-4 BFT
+   finality, ledger gossip, Relay v2, DCUtR, and direct communication after relay
+   departure;
+9. runs every workspace test, including CRDT, membership, replication repair,
    BFT, tampering, AutoNAT, Relay v2, DCUtR, resource limits, and restart replay;
-9. compiles the browser transports for `wasm32-unknown-unknown`; and
-10. removes only the dedicated E2E containers, network, and volumes.
+10. compiles the browser transports for `wasm32-unknown-unknown`; and
+11. removes only the dedicated E2E containers, network, and volumes.
 
 The final line must be:
 
 ~~~text
-result=PASS p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true adversarial=true browser=true
+result=PASS p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true
 ~~~
 
 The concise execution trace is written to `e2e-output/latest.txt`. A failed
@@ -380,6 +385,8 @@ docker compose run --rm dev sh -c \\
    cargo test --workspace'
 docker compose run --rm dev cargo check -p peerless-browser \\
   --target wasm32-unknown-unknown
+docker compose run --rm dev cargo run -p peerless-cli -- e2e-features \
+  /tmp/peerless-e2e-features
 docker compose config --quiet
 ~~~
 
@@ -414,6 +421,7 @@ BFT leader/quorum rejection, SQLite recovery, and restart-safe TaskId replay.
 | WAN discovery and content providers | `kademlia_provider_discovery_and_signed_gossip_work` |
 | AutoNAT detection | `autonat_performs_dial_back_and_classifies_reachable_node` |
 | Relay and DCUtR | `circuit_relay_reservation_carries_rpc_between_private_peers` asserts reservation, circuit RPC, successful hole punch, relay shutdown, and continued direct RPC |
+| Public application feature boundary | `peerless e2e-features ...` exercises content, CRDT, membership, replication repair, BFT ledger gossip, Relay, and DCUtR through exported APIs over live sockets |
 | Browser transports | Docker `cargo check -p peerless-browser --target wasm32-unknown-unknown` |
 | 100-image distributed resize | `peerless demo-images ... 100`, 100 verified outputs, zero requester executions, two executor ledgers, and `evidence.json` |
 

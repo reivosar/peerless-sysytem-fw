@@ -16,6 +16,8 @@ libp2p.workspace = true
 peerless-network = { path = "../peerless-network" }
 peerless-node = { path = "../peerless-node" }
 peerless-ledger = { path = "../peerless-ledger" }
+peerless-identity = { path = "../peerless-identity" }
+peerless-protocol = { path = "../peerless-protocol" }
 qrcode.workspace = true
 serde_json.workspace = true
 wat.workspace = true

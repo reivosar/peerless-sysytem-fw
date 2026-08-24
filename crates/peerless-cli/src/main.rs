@@ -16,6 +16,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod e2e;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("peerless: {error}");
@@ -149,6 +151,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         "run" => run_task(args.collect())?,
+        "e2e-features" => {
+            let data = PathBuf::from(
+                args.next()
+                    .unwrap_or_else(|| "peerless-e2e-features".into()),
+            );
+            e2e::run(&data)?;
+        }
         "demo-images" => {
             let data = PathBuf::from(args.next().unwrap_or_else(|| "peerless-image-demo".into()));
             let count = args
@@ -365,7 +374,7 @@ fn add_peer(network: &P2pRpc, value: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn print_help() {
-    println!("peerless start [DATA] [QUIC_MULTIADDR]\npeerless identity [DATA]\npeerless invite DATA NETWORK MEMBER OUTPUT [BOOTSTRAP...]\npeerless join DATA INVITATION\npeerless qr INVITATION\npeerless peers [DATA]\npeerless status [DATA]\npeerless inspect peers|tasks|storage|ledger [DATA]\npeerless run DATA WASM INTEGER [QUIC_MULTIADDR/p2p/PEER_ID ...]\npeerless demo-images [DATA] [COUNT]");
+    println!("peerless start [DATA] [QUIC_MULTIADDR]\npeerless identity [DATA]\npeerless invite DATA NETWORK MEMBER OUTPUT [BOOTSTRAP...]\npeerless join DATA INVITATION\npeerless qr INVITATION\npeerless peers [DATA]\npeerless status [DATA]\npeerless inspect peers|tasks|storage|ledger [DATA]\npeerless run DATA WASM INTEGER [QUIC_MULTIADDR/p2p/PEER_ID ...]\npeerless e2e-features [DATA]\npeerless demo-images [DATA] [COUNT]");
 }
 fn print_qr(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     let code = qrcode::QrCode::new(bytes)?;
