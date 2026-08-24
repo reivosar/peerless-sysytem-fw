@@ -187,6 +187,7 @@ impl Invitation {
         temporary: impl AsRef<Path>,
     ) -> Result<bool, LedgerError> {
         Ok(self.version == 1
+            && self.issued_at <= now
             && &self.membership.member == member
             && self.membership.verify(
                 &HashSet::from([self.membership.issuer.clone()]),
@@ -636,6 +637,20 @@ mod tests {
         assert!(!invitation
             .verify_for(member.node_id(), 20, root.path())
             .unwrap());
+
+        let future = Invitation::issue(
+            "mesh".into(),
+            member.node_id().clone(),
+            vec!["execute".into()],
+            None,
+            Vec::new(),
+            11,
+            &issuer,
+        )
+        .unwrap();
+        assert!(!future
+            .verify_for(member.node_id(), 10, root.path())
+            .unwrap());
     }
 
     #[test]
@@ -687,5 +702,68 @@ mod tests {
             .signatures
             .retain(|signature| &signature.signer != leader.node_id());
         assert!(!consensus.verify(&block, root.path()).unwrap());
+    }
+
+    #[test]
+    fn ledger_rejects_every_block_integrity_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let a = NodeIdentity::load_or_generate(root.path().join("matrix-a")).unwrap();
+        let b = NodeIdentity::load_or_generate(root.path().join("matrix-b")).unwrap();
+        let consensus = QuorumConsensus::new(
+            "matrix",
+            HashSet::from([a.node_id().clone(), b.node_id().clone()]),
+            2,
+        )
+        .unwrap();
+        let proposal = Ledger::open(root.path().join("proposal")).unwrap();
+        let event = SignedEvent::seal(
+            LedgerEvent::TaskCreated {
+                task_id: "integrity".into(),
+            },
+            &a,
+        )
+        .unwrap();
+        let mut valid = proposal.next_block(vec![event], 10, "matrix").unwrap();
+        consensus.finalize(&mut valid, &[&a, &b]).unwrap();
+
+        let mut mutations = Vec::new();
+        let mut version = valid.clone();
+        version.version += 1;
+        mutations.push(version);
+        let mut previous = valid.clone();
+        previous.previous = Some(hash(b"wrong previous"));
+        mutations.push(previous);
+        let mut height = valid.clone();
+        height.height += 1;
+        mutations.push(height);
+        let mut timestamp = valid.clone();
+        timestamp.timestamp += 1;
+        mutations.push(timestamp);
+        let mut root_hash = valid.clone();
+        root_hash.events_root[0] ^= 1;
+        mutations.push(root_hash);
+        let mut event_payload = valid.clone();
+        event_payload.events[0].event = LedgerEvent::TaskCreated {
+            task_id: "changed".into(),
+        };
+        mutations.push(event_payload);
+        let mut event_signature = valid.clone();
+        event_signature.events[0].signature[0] ^= 1;
+        mutations.push(event_signature);
+        let mut network = valid.clone();
+        network.consensus.network_id = "other".into();
+        mutations.push(network);
+        let mut approval = valid;
+        approval.consensus.signatures[0].signature[0] ^= 1;
+        mutations.push(approval);
+
+        for (index, block) in mutations.into_iter().enumerate() {
+            let mut ledger = Ledger::open(root.path().join(format!("mutation-{index}"))).unwrap();
+            assert!(matches!(
+                ledger.append(block, &consensus, root.path()),
+                Err(LedgerError::InvalidBlock)
+            ));
+            assert_eq!(ledger.height(), 0);
+        }
     }
 }

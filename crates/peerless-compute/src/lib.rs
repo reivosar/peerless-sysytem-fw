@@ -268,6 +268,11 @@ impl PeerReputation {
 
 pub fn eligible(task: &Task, node: &NodeCapability, now: u64) -> bool {
     node.is_fresh_at(now)
+        && node.available_cpu.is_finite()
+        && node.available_cpu > 0.0
+        && node.available_cpu <= 1.0
+        && node.load.is_finite()
+        && (0.0..=1.0).contains(&node.load)
         && task_memory_limit(task).is_some_and(|limit| node.available_memory >= limit)
         && node.available_storage >= task.requirements.minimum_storage
         && node.supports(&task.requirements.runtime)
@@ -379,6 +384,16 @@ mod tests {
         let mut expired = base.capability.clone();
         expired.expires_at = now;
         cases.push(expired);
+        for invalid_cpu in [0.0, -0.1, 1.1, f64::NAN, f64::INFINITY] {
+            let mut invalid = base.capability.clone();
+            invalid.available_cpu = invalid_cpu;
+            cases.push(invalid);
+        }
+        for invalid_load in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            let mut invalid = base.capability.clone();
+            invalid.load = invalid_load;
+            cases.push(invalid);
+        }
         assert!(cases
             .iter()
             .all(|capability| !eligible(&task(), capability, now)));
@@ -514,6 +529,31 @@ mod tests {
                 },
                 &[a, b]
             ),
+            Err(VerificationError::InsufficientExecutions)
+        );
+
+        for invalid in [
+            VerificationPolicy::Replicate(0),
+            VerificationPolicy::Quorum {
+                executions: 0,
+                required_matches: 0,
+            },
+            VerificationPolicy::Quorum {
+                executions: 2,
+                required_matches: 0,
+            },
+            VerificationPolicy::Quorum {
+                executions: 2,
+                required_matches: 3,
+            },
+        ] {
+            assert_eq!(
+                verify_outputs(&invalid, &[a, a, a]),
+                Err(VerificationError::InsufficientExecutions)
+            );
+        }
+        assert_eq!(
+            verify_outputs(&VerificationPolicy::TrustExecutor, &[]),
             Err(VerificationError::InsufficientExecutions)
         );
     }

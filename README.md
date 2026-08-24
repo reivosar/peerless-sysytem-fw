@@ -358,7 +358,8 @@ node-data volumes. It then:
 5. stops the selected executor and proves a different live peer executes the next request;
 6. restarts the first executor and proves its Task and Ledger survive restart;
 7. stops the application nodes to isolate the remaining network scenarios;
-8. runs the public application APIs over real sockets for DHT content fetch,
+8. runs the public application APIs five times with independent state over real
+   sockets for DHT content fetch,
    signed CRDT convergence, membership rejection, replica repair, 3-of-4 BFT
    finality, ledger gossip, Relay v2, DCUtR, and direct communication after relay
    departure;
@@ -370,7 +371,7 @@ node-data volumes. It then:
 The final line must be:
 
 ~~~text
-result=PASS p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true
+result=PASS falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true
 ~~~
 
 The concise execution trace is written to `e2e-output/latest.txt`. A failed
@@ -430,6 +431,10 @@ content tampering; transport and browser boundary checks; departure, lease, and
 restart recovery; multi-replica, CRDT, quorum, and BFT correctness; and a clean
 Docker reproduction using format, warning-free clippy, the serial full test
 suite, WASM target check, Compose validation, and the 100-image run.
+
+The complete finite failure-mode and equivalence-class matrix is documented in
+[`docs/TEST-MATRIX.md`](docs/TEST-MATRIX.md). It distinguishes covered state
+transitions from mathematically unbounded input and network schedules.
 
 ## Core principle
 

@@ -111,13 +111,18 @@ record 'phase=isolation action=stop-e2e-nodes-before-adversarial-tests'
 "${compose[@]}" stop node-a node-b node-c
 
 record 'phase=public-api action=full-feature-scenario'
-features_output="$("${compose[@]}" run --rm dev cargo run -p peerless-cli -- \
-  e2e-features /tmp/peerless-e2e-features)"
-printf '%s\n' "$features_output" | tee -a "$evidence"
-grep -q 'result=PASS content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true' <<<"$features_output"
+for pass in $(seq 1 5); do
+  record "falsification-pass=$pass"
+  features_output="$("${compose[@]}" run --rm dev cargo run -p peerless-cli -- \
+    e2e-features "/tmp/peerless-e2e-features-$pass")"
+  printf '%s\n' "$features_output" | tee -a "$evidence"
+  grep -q 'result=PASS content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true' <<<"$features_output"
+done
 
 record 'phase=adversarial action=workspace-tests'
+"${compose[@]}" run --rm dev cargo fmt --all -- --check
+"${compose[@]}" run --rm dev cargo clippy --workspace --all-targets -- -D warnings
 "${compose[@]}" run --rm dev cargo test --workspace -- --test-threads=1
 "${compose[@]}" run --rm dev cargo check -p peerless-browser --target wasm32-unknown-unknown
 
-record 'result=PASS p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true'
+record 'result=PASS falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true'

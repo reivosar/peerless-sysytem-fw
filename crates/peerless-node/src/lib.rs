@@ -2537,6 +2537,53 @@ mod tests {
     }
 
     #[test]
+    fn replication_rejects_invalid_policy_and_unmet_minimum() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = PeerlessNode::open(root.path().join("policy-owner")).unwrap();
+        let network = owner
+            .serve_p2p("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let id = owner.put(b"single-copy").unwrap();
+        for policy in [
+            ReplicationPolicy {
+                minimum_replicas: 0,
+                target_replicas: 0,
+            },
+            ReplicationPolicy {
+                minimum_replicas: 2,
+                target_replicas: 1,
+            },
+        ] {
+            assert!(matches!(
+                owner.replicate_p2p(&network, std::iter::empty::<PeerId>(), id, policy),
+                Err(NodeError::InsufficientReplicas {
+                    actual: 0,
+                    minimum: _
+                })
+            ));
+            assert!(matches!(
+                owner.repair_replication_p2p(&network, id, policy, &mut HashSet::new()),
+                Err(NodeError::InsufficientReplicas {
+                    actual: 0,
+                    minimum: _
+                })
+            ));
+        }
+
+        let valid_but_unmet = ReplicationPolicy {
+            minimum_replicas: 2,
+            target_replicas: 2,
+        };
+        assert!(matches!(
+            owner.replicate_p2p(&network, std::iter::empty::<PeerId>(), id, valid_but_unmet),
+            Err(NodeError::InsufficientReplicas {
+                actual: 1,
+                minimum: 2
+            })
+        ));
+    }
+
+    #[test]
     fn multi_executor_verification_replaces_a_departed_peer() {
         let root = tempfile::tempdir().unwrap();
         let requester = PeerlessNode::open(root.path().join("verify-requester")).unwrap();

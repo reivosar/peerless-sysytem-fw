@@ -110,12 +110,13 @@ impl StateDocument {
 }
 
 fn safe_name(name: &str) -> String {
-    name.chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character
+    name.as_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                char::from(*byte).to_string()
             } else {
-                '_'
+                format!("~{byte:02x}")
             }
         })
         .collect()
@@ -173,5 +174,29 @@ mod tests {
                 .as_deref(),
             Some("peerless")
         );
+    }
+
+    #[test]
+    fn distinct_and_hostile_document_names_never_alias() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open(root.path()).unwrap();
+        let names = ["a/b", "a?b", "a~2fb", "../escape", "日本語", "a_b"];
+        for (index, name) in names.iter().enumerate() {
+            let mut document = store.document(name).unwrap();
+            document.put("index", &index.to_string()).unwrap();
+            document.save().unwrap();
+        }
+        for (index, name) in names.iter().enumerate() {
+            assert_eq!(
+                store.document(name).unwrap().get("index").unwrap(),
+                Some(index.to_string())
+            );
+        }
+        assert!(!root
+            .path()
+            .parent()
+            .unwrap()
+            .join("escape.automerge")
+            .exists());
     }
 }

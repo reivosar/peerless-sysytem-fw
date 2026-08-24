@@ -163,4 +163,39 @@ mod tests {
             value
         );
     }
+
+    #[test]
+    fn frame_rejects_oversize_truncation_and_invalid_json() {
+        let declared_too_large = ((MAX_FRAME as u32) + 1).to_be_bytes().to_vec();
+        assert!(matches!(
+            read_frame(&mut declared_too_large.as_slice()),
+            Err(NetworkError::FrameTooLarge)
+        ));
+
+        let mut truncated = 8u32.to_be_bytes().to_vec();
+        truncated.extend_from_slice(b"short");
+        assert!(matches!(
+            read_frame(&mut truncated.as_slice()),
+            Err(NetworkError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        let mut invalid_json = 1u32.to_be_bytes().to_vec();
+        invalid_json.push(b'{');
+        assert!(matches!(
+            read_frame(&mut invalid_json.as_slice()),
+            Err(NetworkError::Json(_))
+        ));
+
+        let oversized = SignedEnvelope {
+            version: 1,
+            signer: peerless_core::NodeId::from_public_key_bytes(vec![1]),
+            public_key: Vec::new(),
+            payload: vec![0; MAX_FRAME],
+            signature: Vec::new(),
+        };
+        assert!(matches!(
+            write_frame(&mut Vec::new(), &oversized),
+            Err(NetworkError::FrameTooLarge)
+        ));
+    }
 }

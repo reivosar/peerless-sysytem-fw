@@ -258,4 +258,82 @@ mod tests {
         signed.signer = NodeId::derive(b"substituted");
         assert!(!signed.verify(directory.path()).unwrap());
     }
+
+    #[test]
+    fn signed_envelope_rejects_every_field_mutation_and_wrong_payload_type() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::load_or_generate(directory.path()).unwrap();
+        let original = SignedEnvelope::seal(&Message::GetCapability, &identity).unwrap();
+        let mut mutations = Vec::new();
+
+        let mut version = original.clone();
+        version.version = 0;
+        mutations.push(version);
+        let mut signer = original.clone();
+        signer.signer = NodeId::derive(b"other");
+        mutations.push(signer);
+        let mut key = original.clone();
+        key.public_key.push(0);
+        mutations.push(key);
+        let mut payload = original.clone();
+        payload.payload[0] ^= 1;
+        mutations.push(payload);
+        let mut signature = original;
+        signature.signature[0] ^= 1;
+        mutations.push(signature);
+
+        assert!(mutations
+            .iter()
+            .all(|envelope| envelope.open::<Message>(directory.path()).is_err()));
+
+        let wrong_type = SignedEnvelope::seal(&"valid JSON, wrong schema", &identity).unwrap();
+        assert!(matches!(
+            wrong_type.open::<Message>(directory.path()),
+            Err(ProtocolError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn execution_record_rejects_every_signed_field_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::load_or_generate(directory.path()).unwrap();
+        let other = NodeIdentity::load_or_generate(directory.path().join("other")).unwrap();
+        let id = ContentId::of(b"content");
+        let original = SignedExecutionRecord::seal(
+            ExecutionRecord {
+                task_id: "task".into(),
+                executor: identity.node_id().clone(),
+                component: id,
+                input: id,
+                output: id,
+                execution_hash: id,
+                started_at: 1,
+                completed_at: 2,
+            },
+            &identity,
+        )
+        .unwrap();
+        let changed = ContentId::of(b"changed");
+        let mut mutations = Vec::new();
+        for field in 0..10 {
+            let mut value = original.clone();
+            match field {
+                0 => value.record.task_id.push('x'),
+                1 => value.record.executor = other.node_id().clone(),
+                2 => value.record.component = changed,
+                3 => value.record.input = changed,
+                4 => value.record.output = changed,
+                5 => value.record.execution_hash = changed,
+                6 => value.record.started_at += 1,
+                7 => value.record.completed_at += 1,
+                8 => value.public_key = other.public_key_der().to_vec(),
+                9 => value.signature[0] ^= 1,
+                _ => unreachable!(),
+            }
+            mutations.push(value);
+        }
+        assert!(mutations
+            .iter()
+            .all(|record| !record.verify(directory.path()).unwrap()));
+    }
 }

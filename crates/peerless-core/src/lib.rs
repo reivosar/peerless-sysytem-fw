@@ -210,4 +210,36 @@ mod tests {
         assert!(!id.verify(b"tampered"));
         assert_eq!(id.to_string().parse::<ContentId>().unwrap(), id);
     }
+
+    #[test]
+    fn identifier_boundary_and_mutation_matrix() {
+        for size in [0, 1, 31, 32, 33, 1024, 65_536] {
+            let bytes = (0..size)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            let id = ContentId::of(&bytes);
+            assert!(id.verify(&bytes));
+            assert_eq!(id.to_string().parse::<ContentId>().unwrap(), id);
+            if !bytes.is_empty() {
+                for index in [0, bytes.len() / 2, bytes.len() - 1] {
+                    let mut mutated = bytes.clone();
+                    mutated[index] ^= 1;
+                    assert!(!id.verify(&mutated));
+                }
+            }
+        }
+        for invalid in [
+            "",
+            "md5:00000000000000000000000000000000",
+            "sha256:",
+            "sha256:00",
+            "sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "sha256:000000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            assert!(invalid.parse::<ContentId>().is_err(), "accepted {invalid}");
+        }
+        for invalid in ["", "00", "zz", &"00".repeat(31), &"00".repeat(33)] {
+            assert!(invalid.parse::<NodeId>().is_err(), "accepted {invalid}");
+        }
+    }
 }

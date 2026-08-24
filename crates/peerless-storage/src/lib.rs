@@ -112,6 +112,7 @@ impl FileCas {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn put_is_idempotent_and_get_verifies_content() {
@@ -141,5 +142,29 @@ mod tests {
         fs::write(cas.path_for(id), b"corrupt").unwrap();
         assert!(matches!(cas.get(id), Err(CasError::Corrupt(found)) if found == id));
         assert!(matches!(cas.put(b"authentic"), Err(CasError::Corrupt(found)) if found == id));
+    }
+
+    #[test]
+    fn concurrent_idempotent_puts_leave_one_complete_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = Arc::new(FileCas::open(directory.path()).unwrap());
+        let barrier = Arc::new(Barrier::new(16));
+        let threads = (0..16)
+            .map(|_| {
+                let cas = Arc::clone(&cas);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cas.put(b"concurrent immutable object")
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_eq!(cas.get(ids[0]).unwrap(), b"concurrent immutable object");
+        assert_eq!(cas.stats().unwrap(), (1, 27));
     }
 }
