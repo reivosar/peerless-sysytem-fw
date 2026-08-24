@@ -8,7 +8,6 @@ use peerless_protocol::SignedEnvelope;
 use std::{
     collections::HashSet,
     error::Error,
-    net::UdpSocket,
     path::Path,
     thread,
     time::{Duration, Instant},
@@ -215,10 +214,7 @@ fn relay_and_hole_punch(root: &Path) -> E2eResult {
     let relay_identity = NodeIdentity::load_or_generate(root.join("relay"))?;
     let private_identity = NodeIdentity::load_or_generate(root.join("private"))?;
     let caller_identity = NodeIdentity::load_or_generate(root.join("caller"))?;
-    let probe = UdpSocket::bind("0.0.0.0:0")?;
-    probe.connect("192.0.2.1:9")?;
-    let ip = probe.local_addr()?.ip();
-    let tcp: Multiaddr = format!("/ip4/{ip}/tcp/0").parse()?;
+    let tcp: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse()?;
     let relay = CircuitRelay::start(relay_identity.keypair(), tcp.clone())?;
     let private = P2pRpc::start_private(private_identity.keypair(), tcp.clone(), |mut request| {
         request.payload.extend_from_slice(b"-handled");

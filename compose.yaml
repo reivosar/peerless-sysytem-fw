@@ -9,6 +9,19 @@ services:
       - .:/workspace
       - peerless-cargo:/cargo
       - peerless-target:/target
+    networks: [build]
+
+  probe:
+    build:
+      context: .
+      target: development
+    working_dir: /workspace
+    entrypoint: []
+    command: /target/debug/peerless status /tmp/probe
+    volumes:
+      - .:/workspace:ro
+      - peerless-cargo:/cargo
+      - peerless-target:/target
     networks: [peerless]
 
   node-a:
@@ -51,7 +64,9 @@ services:
     networks: [peerless]
 
 networks:
-  peerless: {}
+  build: {}
+  peerless:
+    internal: true
 
 volumes:
   peerless-cargo: {}

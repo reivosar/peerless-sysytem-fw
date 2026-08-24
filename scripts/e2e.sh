@@ -37,6 +37,17 @@ node_id() {
     | awk '$1 == "node" { value = $2 } END { print value }'
 }
 
+peer_id() {
+  "${compose[@]}" logs --no-log-prefix "$1" 2>&1 \
+    | awk '$1 == "peer" { value = $2 } END { print value }'
+}
+
+node_ip() {
+  local container
+  container="$("${compose[@]}" ps -q "$1")"
+  docker inspect -f "{{with index .NetworkSettings.Networks \"${project}_peerless\"}}{{.IPAddress}}{{end}}" "$container"
+}
+
 service_for_node() {
   local wanted="$1"
   local service
@@ -53,6 +64,9 @@ record 'phase=build action=compile-runtime'
 "${compose[@]}" run --rm dev cargo build -p peerless-cli
 record 'phase=containers action=start'
 "${compose[@]}" up -d --build node-a node-b node-c
+internal="$(docker network inspect -f '{{.Internal}}' "${project}_peerless")"
+[[ "$internal" == "true" ]]
+record "network name=${project}_peerless internal=$internal external_access=false"
 for service in node-a node-b node-c; do
   wait_for_node "$service"
   id="$(node_id "$service")"
@@ -60,16 +74,22 @@ for service in node-a node-b node-c; do
   record "node service=$service id=$id"
 done
 
+peer_addresses=()
+for service in node-a node-b node-c; do
+  peer_addresses+=("/ip4/$(node_ip "$service")/udp/9718/quic-v1/p2p/$(peer_id "$service")")
+done
+record "topology peers=${#peer_addresses[@]} coordinator=none bootstrap=direct-multiaddr"
+
 record 'phase=wasm action=build'
 "${compose[@]}" run --rm dev cargo build \
   --manifest-path examples/double-wasm/Cargo.toml \
   --target wasm32-unknown-unknown --release
 
 record 'phase=p2p action=remote-execute input=21 expected=42'
-first_output="$("${compose[@]}" run --rm dev cargo run -p peerless-cli -- run \
+first_output="$("${compose[@]}" run --rm probe /target/debug/peerless run \
   /tmp/e2e-requester \
   /target/wasm32-unknown-unknown/release/double.wasm \
-  21)"
+  21 "${peer_addresses[@]}")"
 printf '%s\n' "$first_output" | tee -a "$evidence"
 grep -q 'verified  true' <<<"$first_output"
 grep -q '(42)' <<<"$first_output"
@@ -86,10 +106,16 @@ record "remote service=$first_service executor=$first_executor $tasks $ledger $s
 
 record "phase=departure action=stop service=$first_service"
 "${compose[@]}" stop "$first_service"
-second_output="$("${compose[@]}" run --rm dev cargo run -p peerless-cli -- run \
+live_addresses=()
+for service in node-a node-b node-c; do
+  if [[ "$service" != "$first_service" ]]; then
+    live_addresses+=("/ip4/$(node_ip "$service")/udp/9718/quic-v1/p2p/$(peer_id "$service")")
+  fi
+done
+second_output="$("${compose[@]}" run --rm probe /target/debug/peerless run \
   /tmp/e2e-failover \
   /target/wasm32-unknown-unknown/release/double.wasm \
-  21)"
+  21 "${live_addresses[@]}")"
 printf '%s\n' "$second_output" | tee -a "$evidence"
 grep -q 'verified  true' <<<"$second_output"
 grep -q '(42)' <<<"$second_output"
@@ -113,7 +139,7 @@ record 'phase=isolation action=stop-e2e-nodes-before-adversarial-tests'
 record 'phase=public-api action=full-feature-scenario'
 for pass in $(seq 1 5); do
   record "falsification-pass=$pass"
-  features_output="$("${compose[@]}" run --rm dev cargo run -p peerless-cli -- \
+  features_output="$("${compose[@]}" run --rm probe /target/debug/peerless \
     e2e-features "/tmp/peerless-e2e-features-$pass")"
   printf '%s\n' "$features_output" | tee -a "$evidence"
   grep -q 'result=PASS content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true' <<<"$features_output"
@@ -125,4 +151,4 @@ record 'phase=adversarial action=workspace-tests'
 "${compose[@]}" run --rm dev cargo test --workspace -- --test-threads=1
 "${compose[@]}" run --rm dev cargo check -p peerless-browser --target wasm32-unknown-unknown
 
-record 'result=PASS falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true'
+record 'result=PASS server_free=true runtime_network_internal=true falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true'

@@ -349,10 +349,15 @@ Run the reproducible application-level gate from the repository root:
 ~~~
 
 The script creates a unique Docker Compose project with clean Cargo, build, and
-node-data volumes. It then:
+node-data volumes. Runtime peers and the requester are attached only to a
+Docker `internal: true` network, so they cannot contact an Internet-hosted or
+LAN-hosted coordinator. Dependency downloads happen separately on the build
+network before runtime verification. It then:
 
 1. starts three independent node containers with distinct persistent identities;
-2. starts a fourth requester container and discovers executors through mDNS;
+2. constructs each peer's direct internal QUIC multiaddr from its container IP
+   and Peer ID, then gives all addresses to an ephemeral fourth requester; no
+   discovery, coordinator, API, or database server is involved in this proof;
 3. transfers a real WASM module and input over libp2p QUIC;
 4. verifies the signed remote result is `42` and inspects executor CAS, Task, and Ledger state;
 5. stops the selected executor and proves a different live peer executes the next request;
@@ -371,7 +376,7 @@ node-data volumes. It then:
 The final line must be:
 
 ~~~text
-result=PASS falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true
+result=PASS server_free=true runtime_network_internal=true falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true
 ~~~
 
 The concise execution trace is written to `e2e-output/latest.txt`. A failed

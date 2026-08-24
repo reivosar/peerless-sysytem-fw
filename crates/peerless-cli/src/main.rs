@@ -13,7 +13,7 @@ use std::{
     fs,
     path::PathBuf,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 mod e2e;
@@ -183,21 +183,23 @@ fn run_task(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     for value in &args[3..] {
         add_peer(&network, value)?;
     }
-    if args.len() == 3 {
-        thread::sleep(Duration::from_secs(3));
-    }
-
     let timestamp = now();
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut candidates = Vec::new();
-    for peer in network.peers().keys().copied() {
-        if let Ok(capability) = node.peer_capability_p2p(&network, peer) {
-            candidates.push((
-                peer,
-                PlacementCandidate {
-                    capability,
-                    observation: PlacementObservation::default(),
-                },
-            ));
+    while candidates.is_empty() && Instant::now() < deadline {
+        if args.len() == 3 {
+            thread::sleep(Duration::from_millis(250));
+        }
+        for peer in network.peers().keys().copied() {
+            if let Ok(capability) = node.peer_capability_p2p(&network, peer) {
+                candidates.push((
+                    peer,
+                    PlacementCandidate {
+                        capability,
+                        observation: PlacementObservation::default(),
+                    },
+                ));
+            }
         }
     }
     let task = Task {
@@ -370,7 +372,9 @@ fn add_peer(network: &P2pRpc, value: &str) -> Result<(), Box<dyn Error>> {
         Some(Protocol::P2p(peer)) => peer,
         _ => return Err("bootstrap address must end in /p2p/PEER_ID".into()),
     };
-    network.add_peer(peer, address).map_err(Into::into)
+    network.add_peer(peer, address.clone())?;
+    address.push(Protocol::P2p(peer));
+    network.dial(address).map_err(Into::into)
 }
 
 fn print_help() {
