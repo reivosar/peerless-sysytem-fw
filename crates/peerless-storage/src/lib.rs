@@ -2,10 +2,14 @@
 
 use peerless_core::ContentId;
 use std::{
-    fs, io,
+    fs::{self, OpenOptions},
+    io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use thiserror::Error;
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum CasError {
@@ -38,11 +42,35 @@ impl FileCas {
         let parent = path.parent().expect("CAS paths always have a parent");
         fs::create_dir_all(parent)?;
 
-        let temporary = parent.join(format!(".{}.{}.tmp", id.hex_digest(), std::process::id()));
-        fs::write(&temporary, bytes)?;
-        match fs::rename(&temporary, &path) {
-            Ok(()) => Ok(id),
-            Err(_error) if path.exists() => {
+        let (temporary, mut file) = loop {
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                ".{}.{}.{sequence}.tmp",
+                id.hex_digest(),
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        drop(file);
+        match fs::hard_link(&temporary, &path) {
+            Ok(()) => {
+                fs::remove_file(&temporary)?;
+                Ok(id)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let _ = fs::remove_file(&temporary);
                 self.verify_existing(id, &path)?;
                 Ok(id)
