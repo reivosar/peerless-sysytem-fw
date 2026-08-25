@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 peerless-protocol = { path = "../peerless-protocol" }
+peerless-storage = { path = "../peerless-storage" }
 futures.workspace = true
 libp2p.workspace = true
 serde.workspace = true

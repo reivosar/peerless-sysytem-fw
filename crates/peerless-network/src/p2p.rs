@@ -7,6 +7,8 @@ use libp2p::{
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
 };
 use peerless_protocol::SignedEnvelope;
+use peerless_storage::{atomic_replace, read_limited};
+use serde::de::{Error as DeError, SeqAccess, Visitor};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -20,6 +22,48 @@ use std::{
 use tokio::sync::mpsc;
 
 type GossipMessage = (String, PeerId, Vec<u8>);
+
+const MAX_PEER_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PEER_CACHE_ENTRIES: usize = 4_096;
+
+fn parse_peer_cache(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+    struct BoundedEntries;
+    impl<'de> Visitor<'de> for BoundedEntries {
+        type Value = Vec<(String, String)>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_PEER_CACHE_ENTRIES} peer cache entries"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut entries = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(MAX_PEER_CACHE_ENTRIES),
+            );
+            while let Some(entry) = sequence.next_element()? {
+                if entries.len() == MAX_PEER_CACHE_ENTRIES {
+                    return Err(A::Error::custom("peer cache exceeds entry limit"));
+                }
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let entries = serde::Deserializer::deserialize_seq(&mut deserializer, BoundedEntries)
+        .map_err(|error| error.to_string())?;
+    deserializer.end().map_err(|error| error.to_string())?;
+    Ok(entries)
+}
 
 #[derive(NetworkBehaviour)]
 struct RelayOnlyBehaviour {
@@ -136,7 +180,7 @@ enum Command {
         SignedEnvelope,
         std_mpsc::Sender<Result<SignedEnvelope, String>>,
     ),
-    Provide(kad::RecordKey),
+    Provide(kad::RecordKey, std_mpsc::Sender<Result<(), String>>),
     FindProviders(
         kad::RecordKey,
         std_mpsc::Sender<Result<HashSet<PeerId>, String>>,
@@ -313,6 +357,7 @@ impl P2pRpc {
                 swarm.listen_on(listen_address).expect("QUIC listen failed");
                 let mut pending = HashMap::new();
                 let mut provider_queries = HashMap::new();
+                let mut providing_queries = HashMap::new();
                 loop {
                     tokio::select! {
                         Some(command) = commands.recv() => match command {
@@ -334,7 +379,12 @@ impl P2pRpc {
                                 let id = swarm.behaviour_mut().rpc.send_request(&peer, envelope);
                                 pending.insert(id, response);
                             }
-                            Command::Provide(key) => { let _ = swarm.behaviour_mut().kad.start_providing(key); }
+                            Command::Provide(key, response) => {
+                                match swarm.behaviour_mut().kad.start_providing(key) {
+                                    Ok(query) => { providing_queries.insert(query, response); }
+                                    Err(error) => { let _ = response.send(Err(error.to_string())); }
+                                }
+                            }
                             Command::FindProviders(key, response) => {
                                 let query = swarm.behaviour_mut().kad.get_providers(key);
                                 provider_queries.insert(query, response);
@@ -368,6 +418,12 @@ impl P2pRpc {
                                     }
                                     Err(error) => { if let Some(sender) = provider_queries.remove(&id) { let _ = sender.send(Err(error.to_string())); } }
                                     _ => {}
+                                }
+                            }
+                            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result: kad::QueryResult::StartProviding(result), .. })) => {
+                                if let Some(sender) = providing_queries.remove(&id) {
+                                    let result = result.map(|_| ()).map_err(|error| error.to_string());
+                                    let _ = sender.send(result);
                                 }
                             }
                             SwarmEvent::Behaviour(BehaviourEvent::Gossip(gossipsub::Event::Message { propagation_source, message, .. })) => {
@@ -544,9 +600,8 @@ impl P2pRpc {
         if !path.exists() {
             return Ok(0);
         }
-        let entries: Vec<(String, String)> =
-            serde_json::from_slice(&std::fs::read(path).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string())?;
+        let bytes = read_limited(path, MAX_PEER_CACHE_BYTES).map_err(|error| error.to_string())?;
+        let entries = parse_peer_cache(&bytes)?;
         let mut loaded = 0;
         for (peer, address) in entries {
             self.add_peer(
@@ -574,18 +629,22 @@ impl P2pRpc {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(
-            &temporary,
-            serde_json::to_vec_pretty(&entries).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        std::fs::rename(temporary, path).map_err(|error| error.to_string())
+        if entries.len() > MAX_PEER_CACHE_ENTRIES {
+            return Err("peer cache exceeds entry limit".into());
+        }
+        let bytes = serde_json::to_vec_pretty(&entries).map_err(|error| error.to_string())?;
+        if bytes.len() as u64 > MAX_PEER_CACHE_BYTES {
+            return Err("peer cache exceeds size limit".into());
+        }
+        atomic_replace(path, &bytes, Some(0o600)).map_err(|error| error.to_string())
     }
     pub fn provide(&self, key: impl AsRef<[u8]>) -> Result<(), String> {
+        let (tx, rx) = std_mpsc::channel();
         self.command
-            .send(Command::Provide(kad::RecordKey::new(&key)))
-            .map_err(|error| error.to_string())
+            .send(Command::Provide(kad::RecordKey::new(&key), tx))
+            .map_err(|error| error.to_string())?;
+        rx.recv_timeout(Duration::from_secs(35))
+            .map_err(|error| error.to_string())?
     }
     pub fn find_providers(&self, key: impl AsRef<[u8]>) -> Result<HashSet<PeerId>, String> {
         let (tx, rx) = std_mpsc::channel();
@@ -704,6 +763,21 @@ mod tests {
     }
 
     #[test]
+    fn peer_cache_parser_stops_at_the_entry_limit() {
+        let maximum =
+            serde_json::to_vec(&vec![("peer", "address"); MAX_PEER_CACHE_ENTRIES]).unwrap();
+        assert_eq!(
+            parse_peer_cache(&maximum).unwrap().len(),
+            MAX_PEER_CACHE_ENTRIES
+        );
+        let excessive =
+            serde_json::to_vec(&vec![("peer", "address"); MAX_PEER_CACHE_ENTRIES + 1]).unwrap();
+        assert!(parse_peer_cache(&excessive)
+            .unwrap_err()
+            .contains("entry limit"));
+    }
+
+    #[test]
     fn quic_request_response_round_trip() {
         let root = tempfile::tempdir().unwrap();
         let first_identity = NodeIdentity::load_or_generate(root.path().join("first")).unwrap();
@@ -769,7 +843,6 @@ mod tests {
         second.subscribe("peerless/state/v1").unwrap();
 
         first.provide(b"sha256:content").unwrap();
-        std::thread::sleep(Duration::from_secs(1));
         let providers = second.find_providers(b"sha256:content").unwrap();
         assert!(providers.contains(&first.peer_id()));
 

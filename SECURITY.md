@@ -48,6 +48,12 @@ that property.
   bounded pending/established connections, and per-peer connection limits.
 - Bounded content size, chunk size, concurrent uploads, in-flight bytes, and
   task slots.
+- Bounded peer-cache, membership, CRDT, and ledger reads; peer-cache sequence
+  decoding stops at its entry cap instead of allocating the full input.
+- Crash-safe atomic persistence with exclusive temporary files, `fsync`,
+  private creation modes, and cross-store CRDT file locking/merge.
+- Kademlia provider publication waits for protocol completion before content is
+  advertised as fetchable.
 - Content-address verification, signed results, replay/idempotency checks, and
   membership-aware ledger validation.
 - Identity directories are `0700`; key files are `0600`; symlink keys and

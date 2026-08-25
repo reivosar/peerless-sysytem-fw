@@ -3,6 +3,7 @@
 use peerless_core::{ContentId, NodeId};
 use peerless_identity::{verify, IdentityError, NodeIdentity};
 use peerless_protocol::ExecutionRecord;
+use peerless_storage::{atomic_create, read_limited};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -13,6 +14,7 @@ use std::{
 use thiserror::Error;
 
 pub type Hash = [u8; 32];
+const MAX_BLOCK_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LedgerEvent {
@@ -390,9 +392,41 @@ impl Ledger {
                 entry.path().extension().and_then(|value| value.to_str()) == Some("json")
             })
             .map(|entry| {
-                serde_json::from_slice(&fs::read(entry.path())?).map_err(LedgerError::from)
+                let bytes = read_limited(&entry.path(), MAX_BLOCK_BYTES)
+                    .map_err(|_| LedgerError::InvalidBlock)?;
+                let block: Block = serde_json::from_slice(&bytes)?;
+                let expected_name =
+                    format!("{:020}-{}.json", block.height, hex_string(block.hash()?));
+                if entry.file_name().to_string_lossy() != expected_name {
+                    return Err(LedgerError::InvalidBlock);
+                }
+                Ok(block)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut previous = None;
+        let mut network_id: Option<&str> = None;
+        let mut last_timestamp = None;
+        for (height, block) in blocks.iter().enumerate() {
+            if block.version != 1
+                || block.height != height as u64
+                || block.previous != previous
+                || block.events_root
+                    != merkle_root(
+                        &block
+                            .events
+                            .iter()
+                            .map(SignedEvent::hash)
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )
+                || network_id.is_some_and(|known| known != block.consensus.network_id)
+                || last_timestamp.is_some_and(|known| known > block.timestamp)
+            {
+                return Err(LedgerError::InvalidBlock);
+            }
+            network_id = Some(&block.consensus.network_id);
+            last_timestamp = Some(block.timestamp);
+            previous = Some(block.hash()?);
+        }
         Ok(Self { root, blocks })
     }
     pub fn next_block(
@@ -434,6 +468,11 @@ impl Ledger {
             .all(|valid| valid);
         if block.height != self.blocks.len() as u64
             || block.previous != self.blocks.last().map(Block::hash).transpose()?
+            || block.version != 1
+            || self
+                .blocks
+                .last()
+                .is_some_and(|previous| block.timestamp < previous.timestamp)
             || block.events_root
                 != merkle_root(
                     &block
@@ -454,7 +493,11 @@ impl Ledger {
             block.height,
             hex_string(block_hash)
         ));
-        fs::write(path, serde_json::to_vec_pretty(&block)?)?;
+        let bytes = serde_json::to_vec_pretty(&block)?;
+        if bytes.len() as u64 > MAX_BLOCK_BYTES {
+            return Err(LedgerError::InvalidBlock);
+        }
+        atomic_create(&path, &bytes, None)?;
         self.blocks.push(block);
         Ok(block_hash)
     }
@@ -537,6 +580,7 @@ pub enum LedgerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Seek;
     #[test]
     fn quorum_chain_and_merkle_proof_reject_tampering() {
         let root = tempfile::tempdir().unwrap();
@@ -581,6 +625,49 @@ mod tests {
             Ledger::open(root.path().join("ledger")).unwrap().height(),
             1
         );
+    }
+
+    #[test]
+    fn persisted_ledger_rejects_renamed_and_oversized_blocks() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::load_or_generate(root.path().join("identity")).unwrap();
+        let consensus =
+            QuorumConsensus::new("mesh", HashSet::from([identity.node_id().clone()]), 1).unwrap();
+        let ledger_root = root.path().join("ledger");
+        let mut ledger = Ledger::open(&ledger_root).unwrap();
+        let event = SignedEvent::seal(
+            LedgerEvent::TaskCreated {
+                task_id: "one".into(),
+            },
+            &identity,
+        )
+        .unwrap();
+        let mut block = ledger.next_block(vec![event], 1, "mesh").unwrap();
+        consensus.finalize(&mut block, &[&identity]).unwrap();
+        ledger.append(block, &consensus, root.path()).unwrap();
+        let original = fs::read_dir(&ledger_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let renamed = ledger_root.join("00000000000000000000-forged.json");
+        fs::rename(&original, &renamed).unwrap();
+        assert!(matches!(
+            Ledger::open(&ledger_root),
+            Err(LedgerError::InvalidBlock)
+        ));
+
+        fs::remove_file(renamed).unwrap();
+        let oversized = ledger_root.join(format!("{:020}-{}.json", 0, "0".repeat(64)));
+        let mut file = fs::File::create(oversized).unwrap();
+        file.seek(std::io::SeekFrom::Start(MAX_BLOCK_BYTES))
+            .unwrap();
+        file.set_len(MAX_BLOCK_BYTES + 1).unwrap();
+        assert!(matches!(
+            Ledger::open(&ledger_root),
+            Err(LedgerError::InvalidBlock)
+        ));
     }
     #[test]
     fn quorum_requires_distinct_members_and_membership_expires() {

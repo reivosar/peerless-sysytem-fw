@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 automerge.workspace = true
+peerless-storage = { path = "../peerless-storage" }
 serde.workspace = true
 thiserror.workspace = true
 

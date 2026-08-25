@@ -16,7 +16,7 @@ use peerless_protocol::{
     ExecutionRecord, Message, ProtocolError, SignedEnvelope, SignedExecutionRecord,
 };
 use peerless_state::{StateDocument, StateError, StateStore};
-use peerless_storage::{CasError, FileCas};
+use peerless_storage::{atomic_replace, read_limited, CasError, FileCas};
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
@@ -39,6 +39,8 @@ const MAX_CONCURRENT_TASKS: usize = 1;
 const REQUEST_WINDOW_MILLIS: u64 = 60_000;
 const MAX_REQUESTS_PER_IDENTITY_PER_WINDOW: u32 = 4_096;
 const MAX_REQUESTS_GLOBAL_PER_WINDOW: u32 = 16_384;
+const MAX_MEMBERSHIP_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_ISSUED_MEMBERSHIPS: usize = 4_096;
 
 #[derive(Debug, Error)]
 pub enum NodeError {
@@ -318,15 +320,24 @@ impl PeerlessNode {
             }),
         };
         if node.inner.membership_file.exists() {
-            let invitation: Invitation =
-                serde_json::from_slice(&std::fs::read(&node.inner.membership_file)?)
-                    .map_err(ProtocolError::from)?;
+            let invitation: Invitation = serde_json::from_slice(&read_bounded_file(
+                &node.inner.membership_file,
+                MAX_MEMBERSHIP_FILE_BYTES,
+            )?)
+            .map_err(ProtocolError::from)?;
             node.activate_invitation(&invitation, now())?;
         }
         if node.inner.issued_memberships_file.exists() {
-            let memberships: Vec<Membership> =
-                serde_json::from_slice(&std::fs::read(&node.inner.issued_memberships_file)?)
-                    .map_err(ProtocolError::from)?;
+            let memberships: Vec<Membership> = serde_json::from_slice(&read_bounded_file(
+                &node.inner.issued_memberships_file,
+                MAX_MEMBERSHIP_FILE_BYTES,
+            )?)
+            .map_err(ProtocolError::from)?;
+            if memberships.len() > MAX_ISSUED_MEMBERSHIPS {
+                return Err(NodeError::Rejected(
+                    "issued membership limit exceeded".into(),
+                ));
+            }
             for membership in memberships {
                 node.register_issued_membership(membership, now(), false)?;
             }
@@ -365,13 +376,11 @@ impl PeerlessNode {
                 "invitation is invalid, expired, or addressed to another node".into(),
             ));
         }
-        if let Some(parent) = self.inner.membership_file.parent() {
-            std::fs::create_dir_all(parent)?;
+        let bytes = serde_json::to_vec_pretty(invitation).map_err(ProtocolError::from)?;
+        if bytes.len() as u64 > MAX_MEMBERSHIP_FILE_BYTES {
+            return Err(NodeError::Rejected("invitation exceeds size limit".into()));
         }
-        std::fs::write(
-            &self.inner.membership_file,
-            serde_json::to_vec_pretty(invitation).map_err(ProtocolError::from)?,
-        )?;
+        atomic_replace(&self.inner.membership_file, &bytes, Some(0o600))?;
         self.activate_invitation(invitation, at)
     }
     fn activate_invitation(&self, invitation: &Invitation, at: u64) -> Result<(), NodeError> {
@@ -429,6 +438,36 @@ impl PeerlessNode {
                 "issued membership is not a valid local certificate".into(),
             ));
         }
+        let mut issued = self
+            .inner
+            .issued_memberships
+            .lock()
+            .expect("issued memberships lock poisoned");
+        let mut candidate = issued.clone();
+        if let Some(known) = candidate
+            .iter_mut()
+            .find(|known| known.member == membership.member)
+        {
+            *known = membership.clone();
+        } else {
+            if candidate.len() >= MAX_ISSUED_MEMBERSHIPS {
+                return Err(NodeError::Rejected(
+                    "issued membership limit exceeded".into(),
+                ));
+            }
+            candidate.push(membership.clone());
+        }
+        let bytes = if persist {
+            let bytes = serde_json::to_vec_pretty(&candidate).map_err(ProtocolError::from)?;
+            if bytes.len() as u64 > MAX_MEMBERSHIP_FILE_BYTES {
+                return Err(NodeError::Rejected(
+                    "issued memberships exceed size limit".into(),
+                ));
+            }
+            Some(bytes)
+        } else {
+            None
+        };
         let mut policy = self
             .inner
             .membership
@@ -440,6 +479,9 @@ impl PeerlessNode {
                 "issued membership belongs to another network".into(),
             ));
         }
+        if let Some(bytes) = bytes {
+            atomic_replace(&self.inner.issued_memberships_file, &bytes, Some(0o600))?;
+        }
         active.permissions.insert(
             membership.member.clone(),
             MemberAccess {
@@ -447,37 +489,7 @@ impl PeerlessNode {
                 expires_at: membership.expires_at,
             },
         );
-        drop(policy);
-        let mut issued = self
-            .inner
-            .issued_memberships
-            .lock()
-            .expect("issued memberships lock poisoned");
-        if let Some(known) = issued
-            .iter_mut()
-            .find(|known| known.member == membership.member)
-        {
-            *known = membership;
-        } else {
-            issued.push(membership);
-        }
-        if persist {
-            if let Some(parent) = self.inner.issued_memberships_file.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(
-                &self.inner.issued_memberships_file,
-                serde_json::to_vec_pretty(&*issued).map_err(ProtocolError::from)?,
-            )?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    &self.inner.issued_memberships_file,
-                    std::fs::Permissions::from_mode(0o600),
-                )?;
-            }
-        }
+        *issued = candidate;
         Ok(())
     }
     pub fn apply_invitation_bootstrap(
@@ -1843,6 +1855,16 @@ impl PeerlessNode {
         }
     }
 }
+fn read_bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>, NodeError> {
+    read_limited(path, limit).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            NodeError::Rejected(format!("persisted metadata exceeds {limit} byte limit"))
+        } else {
+            NodeError::Io(error)
+        }
+    })
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3147,5 +3169,18 @@ mod tests {
         }
         let extra = NodeId::from_public_key_bytes(vec![255; 8]);
         assert!(!node.consume_request_budget(&extra, second_window));
+    }
+
+    #[test]
+    fn oversized_membership_metadata_is_rejected_before_json_allocation() {
+        let root = tempfile::tempdir().unwrap();
+        drop(PeerlessNode::open(root.path()).unwrap());
+        let path = root.path().join("metadata/membership-invitation.json");
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(MAX_MEMBERSHIP_FILE_BYTES + 1).unwrap();
+        assert!(matches!(
+            PeerlessNode::open(root.path()),
+            Err(NodeError::Rejected(message)) if message.contains("exceeds")
+        ));
     }
 }

@@ -294,6 +294,15 @@ peer reputation, latency history, and observability events across restarts.
 CAS objects, Automerge documents, ledger blocks, identity, membership, and the
 known-peer cache use their own durable stores.
 
+Mutable files are written through unique exclusive temporary files, flushed,
+and atomically published; private membership and peer-cache files are created
+as `0600`. CRDT saves take both an in-process mutex and an operating-system file
+lock, merge the latest on-disk snapshot, and then publish, so concurrent stale
+writers do not silently discard one another. Startup reads enforce byte and
+entry limits before deserializing untrusted local metadata. Ledger reopen also
+checks the encoded filename hash, height/previous-hash chain, event Merkle root,
+network continuity, and monotonic timestamps.
+
 An issuer creates a signed, member-bound invitation containing network ID,
 permissions, expiry, and bootstrap multiaddresses. The CLI writes JSON and a QR
 representation. `join` verifies the issuer signature, intended NodeId, and
@@ -435,6 +444,8 @@ restart persistence. It also performs real AutoNAT dial-back classification,
 Relay v2 reservation and circuit RPC, successful DCUtR upgrade, corrupt chunk
 rejection, departed-executor replacement, three-distinct-executor verification,
 BFT leader/quorum rejection, SQLite recovery, and restart-safe TaskId replay.
+Provider publication is acknowledged only after the Kademlia
+`StartProviding` query completes; immediate lookup is tested without sleeps.
 
 ### Requirement evidence
 
@@ -455,6 +466,8 @@ BFT leader/quorum rejection, SQLite recovery, and restart-safe TaskId replay.
 | Actual independent execution and relocation | `multi_executor_verification_replaces_a_departed_peer` |
 | Replaceable leader/BFT finality | `bft_engine_requires_leader_and_two_f_plus_one_signatures` |
 | WAN discovery and content providers | `kademlia_provider_discovery_and_signed_gossip_work` |
+| Atomic bounded persistence | `concurrent_atomic_replacements_never_expose_partial_data`; `limited_read_stops_at_the_boundary`; `oversized_membership_metadata_is_rejected_before_json_allocation` |
+| Concurrent CRDT persistence | `concurrent_stale_documents_merge_instead_of_losing_updates` uses separate stores sharing one path |
 | AutoNAT detection | `autonat_performs_dial_back_and_classifies_reachable_node` |
 | Relay and DCUtR | `circuit_relay_reservation_carries_rpc_between_private_peers` asserts reservation, circuit RPC, successful hole punch, relay shutdown, and continued direct RPC |
 | Public application feature boundary | `peerless e2e-features ...` exercises content, CRDT, membership, replication repair, BFT ledger gossip, Relay, and DCUtR through exported APIs over live sockets |

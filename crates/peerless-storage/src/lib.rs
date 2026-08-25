@@ -3,13 +3,116 @@
 use peerless_core::ContentId;
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 use thiserror::Error;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Reads at most `limit` bytes and reports `InvalidData` instead of allocating
+/// an attacker-controlled file in full. The bound remains effective if the
+/// file grows after it is opened.
+pub fn read_limited(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(limit.min(64 * 1024)).unwrap_or(64 * 1024));
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {limit} byte limit"),
+        ))
+    } else {
+        Ok(bytes)
+    }
+}
+
+/// Atomically replaces a regular file without ever exposing a partial write.
+///
+/// Temporary files are unique and created with `O_EXCL`; `mode` is applied at
+/// creation time on Unix so private data is never briefly world-readable.
+pub fn atomic_replace(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let (temporary, mut file) = unique_temporary(parent, path.file_name(), mode)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    sync_directory(parent)
+}
+
+/// Atomically creates a new file and refuses to replace an existing one.
+pub fn atomic_create(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let (temporary, mut file) = unique_temporary(parent, path.file_name(), mode)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    match fs::hard_link(&temporary, path) {
+        Ok(()) => {
+            fs::remove_file(&temporary)?;
+            sync_directory(parent)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+fn unique_temporary(
+    parent: &Path,
+    file_name: Option<&std::ffi::OsStr>,
+    mode: Option<u32>,
+) -> io::Result<(PathBuf, fs::File)> {
+    let name = file_name
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("data");
+    loop {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{name}.{}.{sequence}.tmp", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        match options.open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum CasError {
@@ -194,5 +297,45 @@ mod tests {
         assert!(ids.iter().all(|id| *id == ids[0]));
         assert_eq!(cas.get(ids[0]).unwrap(), b"concurrent immutable object");
         assert_eq!(cas.stats().unwrap(), (1, 27));
+    }
+
+    #[test]
+    fn concurrent_atomic_replacements_never_expose_partial_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata");
+        let barrier = Arc::new(Barrier::new(16));
+        let expected = (0..16)
+            .map(|index| format!("writer-{index}:{}", "x".repeat(4096)).into_bytes())
+            .collect::<Vec<_>>();
+        std::thread::scope(|scope| {
+            for payload in &expected {
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    atomic_replace(&path, payload, Some(0o600)).unwrap();
+                });
+            }
+        });
+        assert!(expected.contains(&fs::read(path).unwrap()));
+        assert!(!fs::read_dir(directory.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+    }
+
+    #[test]
+    fn limited_read_stops_at_the_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("untrusted");
+        fs::write(&path, vec![7; 1025]).unwrap();
+        assert_eq!(read_limited(&path, 1025).unwrap().len(), 1025);
+        assert_eq!(
+            read_limited(&path, 1024).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

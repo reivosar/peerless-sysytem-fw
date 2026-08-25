@@ -9,6 +9,7 @@ rust-version.workspace = true
 peerless-core = { path = "../peerless-core" }
 peerless-identity = { path = "../peerless-identity" }
 peerless-protocol = { path = "../peerless-protocol" }
+peerless-storage = { path = "../peerless-storage" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
