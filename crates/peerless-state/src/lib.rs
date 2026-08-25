@@ -315,4 +315,53 @@ mod tests {
         let store = StateStore::open(root.path()).unwrap();
         assert!(matches!(store.document("large"), Err(StateError::TooLarge)));
     }
+
+    #[test]
+    fn disk_loss_smoke_distinguishes_snapshot_recovery_from_silent_loss() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open(root.path()).unwrap();
+        let mut document = store.document("critical").unwrap();
+        document.put("key", "value").unwrap();
+        document.save().unwrap();
+        let snapshot = document.snapshot();
+        drop(document);
+
+        let path = root.path().join("critical.automerge");
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            store.document("critical").unwrap().get("key").unwrap(),
+            None
+        );
+        println!("state-loss-smoke local_document_missing=SILENT_EMPTY_DOCUMENT");
+
+        store.merge_snapshot("critical", &snapshot).unwrap();
+        assert_eq!(
+            store.document("critical").unwrap().get("key").unwrap(),
+            Some("value".into())
+        );
+        println!("state-loss-smoke remote_snapshot_available=RECOVERED");
+
+        fs::write(&path, b"truncated-automerge").unwrap();
+        assert!(matches!(
+            store.document("critical"),
+            Err(StateError::Automerge(_))
+        ));
+        println!("state-loss-smoke document_corrupt=SAFE_READ_FAILURE");
+
+        fs::remove_file(&path).unwrap();
+        store.merge_snapshot("critical", &snapshot).unwrap();
+        fs::remove_file(root.path().join(".persistence.lock")).unwrap();
+        let mut reopened = store.document("critical").unwrap();
+        reopened.put("after-lock-loss", "saved").unwrap();
+        reopened.save().unwrap();
+        assert_eq!(
+            store
+                .document("critical")
+                .unwrap()
+                .get("after-lock-loss")
+                .unwrap(),
+            Some("saved".into())
+        );
+        println!("state-loss-smoke lock_file_missing=RECREATED");
+    }
 }

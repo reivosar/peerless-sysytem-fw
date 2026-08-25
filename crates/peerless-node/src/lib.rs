@@ -3036,6 +3036,318 @@ mod tests {
     }
 
     #[test]
+    fn disk_loss_smoke_exposes_current_recovery_boundary() {
+        fn cas_path(root: &Path, id: ContentId) -> PathBuf {
+            let digest = id.hex_digest();
+            root.join("cas").join(&digest[..2]).join(&digest[2..])
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let owner_root = root.path().join("disk-owner");
+        let b_root = root.path().join("disk-b");
+        let c_root = root.path().join("disk-c");
+        let owner = PeerlessNode::open(&owner_root).unwrap();
+        let b = PeerlessNode::open(&b_root).unwrap();
+        let c = PeerlessNode::open(&c_root).unwrap();
+        let listen: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
+        let owner_network = owner.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let b_network = b.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let c_network = c.serve_p2p_unrestricted(listen).unwrap();
+        for network in [&b_network, &c_network] {
+            owner_network
+                .add_peer(network.peer_id(), network.listen_address().clone())
+                .unwrap();
+        }
+
+        let id = owner.put(b"disk-loss-smoke").unwrap();
+        let policy = ReplicationPolicy {
+            minimum_replicas: 2,
+            target_replicas: 3,
+        };
+        let mut known = owner
+            .replicate_p2p(
+                &owner_network,
+                [b_network.peer_id(), c_network.peer_id()],
+                id,
+                policy,
+            )
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        std::fs::remove_file(cas_path(&b_root, id)).unwrap();
+        assert!(matches!(b.inner.cas.get(id), Err(CasError::NotFound(_))));
+        owner
+            .repair_replication_p2p(&owner_network, id, policy, &mut known)
+            .unwrap();
+        assert_eq!(b.inner.cas.get(id).unwrap(), b"disk-loss-smoke");
+        println!("disk-loss-smoke single_replica_loss=RECOVERED");
+
+        std::fs::write(cas_path(&b_root, id), b"corrupt").unwrap();
+        let report = owner
+            .repair_replication_p2p(&owner_network, id, policy, &mut known)
+            .unwrap();
+        assert!(report.live_replicas.contains(&b_network.peer_id()));
+        assert!(matches!(b.inner.cas.get(id), Err(CasError::Corrupt(_))));
+        println!("disk-loss-smoke corrupt_replica=FALSELY_REPORTED_LIVE");
+        std::fs::remove_file(cas_path(&b_root, id)).unwrap();
+        owner
+            .repair_replication_p2p(&owner_network, id, policy, &mut known)
+            .unwrap();
+        assert_eq!(b.inner.cas.get(id).unwrap(), b"disk-loss-smoke");
+
+        std::fs::write(cas_path(&owner_root, id), b"corrupt").unwrap();
+        assert_eq!(b.inner.cas.get(id).unwrap(), b"disk-loss-smoke");
+        assert_eq!(c.inner.cas.get(id).unwrap(), b"disk-loss-smoke");
+        assert!(matches!(
+            owner.repair_replication_p2p(&owner_network, id, policy, &mut known),
+            Err(NodeError::Storage(CasError::Corrupt(found))) if found == id
+        ));
+        println!("disk-loss-smoke corrupt_owner_with_remote_replicas=NOT_RECOVERED");
+        std::fs::remove_file(cas_path(&owner_root, id)).unwrap();
+        assert!(matches!(
+            owner.repair_replication_p2p(&owner_network, id, policy, &mut known),
+            Err(NodeError::Storage(CasError::NotFound(found))) if found == id
+        ));
+        println!("disk-loss-smoke owner_disk_loss_with_remote_replicas=NOT_RECOVERED");
+
+        std::fs::remove_file(cas_path(&b_root, id)).unwrap();
+        std::fs::remove_file(cas_path(&c_root, id)).unwrap();
+        assert!(matches!(
+            owner.inner.cas.get(id),
+            Err(CasError::NotFound(_))
+        ));
+        assert!(matches!(b.inner.cas.get(id), Err(CasError::NotFound(_))));
+        assert!(matches!(c.inner.cas.get(id), Err(CasError::NotFound(_))));
+        println!("disk-loss-smoke all_replicas_lost=UNRECOVERABLE");
+
+        let identity_root = root.path().join("identity-loss");
+        let original = PeerlessNode::open(&identity_root).unwrap();
+        let original_id = original.node_id().clone();
+        drop(original);
+        std::fs::remove_file(identity_root.join("identity/key.protobuf")).unwrap();
+        let regenerated = PeerlessNode::open(&identity_root).unwrap();
+        assert_ne!(&original_id, regenerated.node_id());
+        println!("disk-loss-smoke identity_key_lost=node_id_changed");
+
+        let corrupt_identity_root = root.path().join("identity-corrupt");
+        drop(PeerlessNode::open(&corrupt_identity_root).unwrap());
+        std::fs::write(
+            corrupt_identity_root.join("identity/key.protobuf"),
+            b"invalid-key",
+        )
+        .unwrap();
+        assert!(matches!(
+            PeerlessNode::open(&corrupt_identity_root),
+            Err(NodeError::Identity(IdentityError::InvalidKey(_)))
+        ));
+        println!("disk-loss-smoke identity_key_corrupt=SAFE_STARTUP_FAILURE");
+    }
+
+    #[test]
+    fn metadata_loss_smoke_exposes_admission_and_history_boundaries() {
+        fn install_self_membership(root: &Path) -> PeerlessNode {
+            let node = PeerlessNode::open(root).unwrap();
+            let invitation = node
+                .issue_invitation(
+                    "disk-smoke",
+                    node.node_id().clone(),
+                    vec!["*".into()],
+                    None,
+                    Vec::new(),
+                )
+                .unwrap();
+            node.install_invitation(&invitation, now()).unwrap();
+            node
+        }
+
+        let root = tempfile::tempdir().unwrap();
+
+        let missing_membership_root = root.path().join("membership-missing");
+        drop(install_self_membership(&missing_membership_root));
+        std::fs::remove_file(missing_membership_root.join("metadata/membership-invitation.json"))
+            .unwrap();
+        let reopened = PeerlessNode::open(&missing_membership_root).unwrap();
+        assert!(!reopened.has_membership());
+        assert!(matches!(
+            reopened.serve_p2p("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()),
+            Err(NodeError::MembershipRequired)
+        ));
+        println!("metadata-loss-smoke membership_missing=SAFE_ADMISSION_DENIAL");
+
+        let corrupt_membership_root = root.path().join("membership-corrupt");
+        drop(install_self_membership(&corrupt_membership_root));
+        std::fs::write(
+            corrupt_membership_root.join("metadata/membership-invitation.json"),
+            b"{truncated",
+        )
+        .unwrap();
+        assert!(matches!(
+            PeerlessNode::open(&corrupt_membership_root),
+            Err(NodeError::Protocol(_))
+        ));
+        println!("metadata-loss-smoke membership_corrupt=SAFE_STARTUP_FAILURE");
+
+        let bound_identity_root = root.path().join("bound-identity-missing");
+        let bound = install_self_membership(&bound_identity_root);
+        let old_id = bound.node_id().clone();
+        drop(bound);
+        std::fs::remove_file(bound_identity_root.join("identity/key.protobuf")).unwrap();
+        assert!(matches!(
+            PeerlessNode::open(&bound_identity_root),
+            Err(NodeError::Rejected(_))
+        ));
+        let regenerated =
+            NodeIdentity::load_or_generate(bound_identity_root.join("identity")).unwrap();
+        assert_ne!(&old_id, regenerated.node_id());
+        println!("metadata-loss-smoke identity_lost_with_membership=SAFE_STARTUP_FAILURE");
+
+        let issued_root = root.path().join("issued-membership-missing");
+        let issuer = install_self_membership(&issued_root);
+        let prospective = NodeIdentity::load_or_generate(root.path().join("prospective")).unwrap();
+        issuer
+            .issue_invitation(
+                "disk-smoke",
+                prospective.node_id().clone(),
+                vec!["execute".into()],
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            issuer
+                .inner
+                .issued_memberships
+                .lock()
+                .expect("issued lock poisoned")
+                .len(),
+            1
+        );
+        drop(issuer);
+        std::fs::remove_file(issued_root.join("metadata/issued-memberships.json")).unwrap();
+        let reopened = PeerlessNode::open(&issued_root).unwrap();
+        assert!(reopened
+            .inner
+            .issued_memberships
+            .lock()
+            .expect("issued lock poisoned")
+            .is_empty());
+        println!("metadata-loss-smoke issued_memberships_missing=AUTHORIZATION_HISTORY_LOST");
+
+        let corrupt_issued_root = root.path().join("issued-membership-corrupt");
+        let issuer = install_self_membership(&corrupt_issued_root);
+        issuer
+            .issue_invitation(
+                "disk-smoke",
+                prospective.node_id().clone(),
+                vec!["execute".into()],
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        drop(issuer);
+        std::fs::write(
+            corrupt_issued_root.join("metadata/issued-memberships.json"),
+            b"[truncated",
+        )
+        .unwrap();
+        assert!(matches!(
+            PeerlessNode::open(&corrupt_issued_root),
+            Err(NodeError::Protocol(_))
+        ));
+        println!("metadata-loss-smoke issued_memberships_corrupt=SAFE_STARTUP_FAILURE");
+
+        let sqlite_root = root.path().join("sqlite-missing");
+        let node = PeerlessNode::open(&sqlite_root).unwrap();
+        node.inner
+            .metadata
+            .event(now(), "disk-smoke", "before-loss")
+            .unwrap();
+        assert_eq!(node.inner.metadata.counts().unwrap().0, 1);
+        drop(node);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = sqlite_root.join(format!("metadata/local.db{suffix}"));
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let reopened = PeerlessNode::open(&sqlite_root).unwrap();
+        assert_eq!(reopened.inner.metadata.counts().unwrap(), (0, 0));
+        println!("metadata-loss-smoke sqlite_missing=LOCAL_HISTORY_LOST");
+
+        let corrupt_sqlite_root = root.path().join("sqlite-corrupt");
+        drop(PeerlessNode::open(&corrupt_sqlite_root).unwrap());
+        std::fs::write(
+            corrupt_sqlite_root.join("metadata/local.db"),
+            b"not-a-sqlite-database",
+        )
+        .unwrap();
+        assert!(matches!(
+            PeerlessNode::open(&corrupt_sqlite_root),
+            Err(NodeError::Metadata(_))
+        ));
+        println!("metadata-loss-smoke sqlite_corrupt=SAFE_STARTUP_FAILURE");
+    }
+
+    #[test]
+    fn peer_cache_loss_smoke_requires_explicit_rediscovery() {
+        let root = tempfile::tempdir().unwrap();
+        let node_root = root.path().join("cache-node");
+        let peer_root = root.path().join("cache-peer");
+        let node = PeerlessNode::open(&node_root).unwrap();
+        let peer = PeerlessNode::open(&peer_root).unwrap();
+        let listen: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
+        let network = node.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let peer_network = peer.serve_p2p_unrestricted(listen).unwrap();
+        network
+            .add_peer(
+                peer_network.peer_id(),
+                peer_network.listen_address().clone(),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while network.peers().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        node.save_peer_cache(&network).unwrap();
+        assert!(node_root.join("metadata/known-peers.json").exists());
+        drop(network);
+        drop(peer_network);
+        drop(node);
+        drop(peer);
+
+        std::fs::remove_file(node_root.join("metadata/known-peers.json")).unwrap();
+        let reopened = PeerlessNode::open(&node_root).unwrap();
+        let reopened_network = reopened
+            .serve_p2p_unrestricted("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(reopened_network.peers().is_empty());
+        println!("metadata-loss-smoke peer_cache_missing=REDISCOVERY_REQUIRED");
+
+        drop(reopened_network);
+        drop(reopened);
+        std::fs::write(node_root.join("metadata/known-peers.json"), b"[truncated").unwrap();
+        let corrupt = PeerlessNode::open(&node_root).unwrap();
+        assert!(matches!(
+            corrupt.serve_p2p_unrestricted("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()),
+            Err(NodeError::P2p(_))
+        ));
+        println!("metadata-loss-smoke peer_cache_corrupt=SAFE_LISTENER_FAILURE");
+
+        let oversized_root = root.path().join("cache-oversized");
+        let oversized = PeerlessNode::open(&oversized_root).unwrap();
+        let cache = oversized_root.join("metadata/known-peers.json");
+        let file = std::fs::File::create(cache).unwrap();
+        file.set_len(4 * 1024 * 1024 + 1).unwrap();
+        assert!(matches!(
+            oversized.serve_p2p_unrestricted("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()),
+            Err(NodeError::P2p(_))
+        ));
+        println!("metadata-loss-smoke peer_cache_oversized=SAFE_LISTENER_FAILURE");
+    }
+
+    #[test]
     fn replication_rejects_invalid_policy_and_unmet_minimum() {
         let root = tempfile::tempdir().unwrap();
         let owner = PeerlessNode::open(root.path().join("policy-owner")).unwrap();

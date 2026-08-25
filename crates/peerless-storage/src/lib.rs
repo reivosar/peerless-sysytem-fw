@@ -338,4 +338,41 @@ mod tests {
             io::ErrorKind::InvalidData
         );
     }
+
+    #[test]
+    fn interrupted_write_smoke_preserves_the_published_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata");
+        atomic_replace(&path, b"published", Some(0o600)).unwrap();
+        fs::write(directory.path().join(".metadata.999.0.tmp"), b"partial").unwrap();
+        assert_eq!(read_limited(&path, 1024).unwrap(), b"published");
+        assert_eq!(
+            atomic_create(&path, b"must-not-overwrite", Some(0o600))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"published");
+        println!("storage-loss-smoke interrupted_temp=IGNORED duplicate_create=REJECTED");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_target_smoke_replaces_link_without_touching_victim() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        let link = directory.path().join("metadata");
+        fs::write(&victim, b"victim-data").unwrap();
+        symlink(&victim, &link).unwrap();
+        atomic_replace(&link, b"replacement", Some(0o600)).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"victim-data");
+        assert_eq!(fs::read(&link).unwrap(), b"replacement");
+        assert!(!fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        println!("storage-loss-smoke symlink_target=NOT_FOLLOWED");
+    }
 }

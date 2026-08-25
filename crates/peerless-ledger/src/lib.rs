@@ -669,6 +669,80 @@ mod tests {
             Err(LedgerError::InvalidBlock)
         ));
     }
+
+    #[test]
+    fn disk_loss_smoke_exposes_tail_rollback_boundary() {
+        fn build_two_blocks(
+            ledger_root: &Path,
+            identity: &NodeIdentity,
+            consensus: &QuorumConsensus,
+            temporary: &Path,
+        ) {
+            let mut ledger = Ledger::open(ledger_root).unwrap();
+            for height in 0..2 {
+                let event = SignedEvent::seal(
+                    LedgerEvent::TaskCreated {
+                        task_id: format!("disk-smoke-{height}"),
+                    },
+                    identity,
+                )
+                .unwrap();
+                let mut block = ledger
+                    .next_block(vec![event], height + 1, "disk-smoke")
+                    .unwrap();
+                consensus.finalize(&mut block, &[identity]).unwrap();
+                ledger.append(block, consensus, temporary).unwrap();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::load_or_generate(root.path().join("identity")).unwrap();
+        let consensus =
+            QuorumConsensus::new("disk-smoke", HashSet::from([identity.node_id().clone()]), 1)
+                .unwrap();
+
+        let tail_root = root.path().join("tail-loss");
+        build_two_blocks(&tail_root, &identity, &consensus, root.path());
+        let mut files = fs::read_dir(&tail_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        files.sort();
+        fs::remove_file(&files[1]).unwrap();
+        assert_eq!(Ledger::open(&tail_root).unwrap().height(), 1);
+        println!("ledger-loss-smoke tail_block_missing=UNDETECTED_ROLLBACK");
+        fs::remove_file(&files[0]).unwrap();
+        assert_eq!(Ledger::open(&tail_root).unwrap().height(), 0);
+        println!("ledger-loss-smoke all_blocks_missing=EMPTY_LEDGER");
+
+        let middle_root = root.path().join("middle-loss");
+        build_two_blocks(&middle_root, &identity, &consensus, root.path());
+        let mut files = fs::read_dir(&middle_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        files.sort();
+        fs::remove_file(&files[0]).unwrap();
+        assert!(matches!(
+            Ledger::open(&middle_root),
+            Err(LedgerError::InvalidBlock)
+        ));
+        println!("ledger-loss-smoke non_tail_block_missing=SAFE_STARTUP_FAILURE");
+
+        let corrupt_root = root.path().join("corrupt-tail");
+        build_two_blocks(&corrupt_root, &identity, &consensus, root.path());
+        let tail = fs::read_dir(&corrupt_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .max()
+            .unwrap();
+        fs::write(tail, b"truncated").unwrap();
+        assert!(Ledger::open(&corrupt_root).is_err());
+        println!("ledger-loss-smoke corrupt_tail=SAFE_STARTUP_FAILURE");
+    }
     #[test]
     fn quorum_requires_distinct_members_and_membership_expires() {
         let root = tempfile::tempdir().unwrap();
