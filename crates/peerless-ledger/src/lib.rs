@@ -476,7 +476,9 @@ pub fn merkle_root(leaves: &[Hash]) -> Hash {
             level.push(*level.last().expect("non-empty"));
         }
         level = level
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| pair_hash(pair[0], pair[1]))
             .collect();
     }
@@ -496,7 +498,9 @@ fn merkle_proof(leaves: &[Hash], index: usize) -> Option<MerkleProof> {
         siblings.push(level[cursor ^ 1]);
         cursor /= 2;
         level = level
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| pair_hash(pair[0], pair[1]))
             .collect();
     }
