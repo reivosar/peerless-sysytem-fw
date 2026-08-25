@@ -776,13 +776,16 @@ impl PeerlessNode {
         Ok(())
     }
     pub fn has_membership(&self) -> bool {
+        self.has_membership_at(now())
+    }
+    fn has_membership_at(&self, at: u64) -> bool {
         self.inner
             .membership
             .read()
             .expect("membership lock poisoned")
             .as_ref()
             .and_then(|policy| policy.permissions.get(self.node_id()))
-            .is_some_and(|access| access.expires_at.is_none_or(|expiry| expiry > now()))
+            .is_some_and(|access| access.expires_at.is_none_or(|expiry| expiry > at))
     }
     pub fn membership_network_id(&self) -> Option<String> {
         self.inner
@@ -2879,7 +2882,8 @@ mod tests {
 
         let expiring_path = root.path().join("expiring-member");
         let expiring = PeerlessNode::open(&expiring_path).unwrap();
-        let expiry = now() + 20;
+        let installed_at = now();
+        let expiry = installed_at + 30_000;
         let expiring_invitation = issuer
             .issue_invitation(
                 "secure-mesh",
@@ -2890,11 +2894,11 @@ mod tests {
             )
             .unwrap();
         expiring
-            .install_invitation(&expiring_invitation, now())
+            .install_invitation(&expiring_invitation, installed_at)
             .unwrap();
         assert!(expiring.has_membership());
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        assert!(!expiring.has_membership());
+        assert!(expiring.has_membership_at(expiry - 1));
+        assert!(!expiring.has_membership_at(expiry));
     }
 
     #[test]
