@@ -1,17 +1,31 @@
 services:
   dev:
+    image: peerless-development:local
+    pull_policy: never
     build:
       context: .
       target: development
     working_dir: /workspace
     command: cargo test --workspace
     volumes:
-      - .:/workspace
+      - .:/workspace:ro
       - peerless-cargo:/cargo
       - peerless-target:/target
     networks: [build]
+    environment:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "false"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev"]
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2.0
 
   probe:
+    image: peerless-development:local
+    pull_policy: never
     build:
       context: .
       target: development
@@ -23,45 +37,91 @@ services:
       - peerless-cargo:/cargo
       - peerless-target:/target
     networks: [peerless]
+    environment:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "false"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev"]
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2.0
 
   node-a:
+    image: peerless-development:local
+    pull_policy: never
     build:
       context: .
       target: development
     working_dir: /workspace
-    command: cargo run -p peerless-cli -- start /data /ip4/0.0.0.0/udp/9718/quic-v1
+    command: cargo run -p peerless-cli -- start --unsafe-open /data /ip4/0.0.0.0/udp/9718/quic-v1
     volumes:
       - .:/workspace:ro
       - peerless-cargo:/cargo
       - peerless-target:/target
       - node-a-data:/data
     networks: [peerless]
+    environment:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "false"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev"]
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2.0
 
   node-b:
+    image: peerless-development:local
+    pull_policy: never
     build:
       context: .
       target: development
     working_dir: /workspace
-    command: cargo run -p peerless-cli -- start /data /ip4/0.0.0.0/udp/9718/quic-v1
+    command: cargo run -p peerless-cli -- start --unsafe-open /data /ip4/0.0.0.0/udp/9718/quic-v1
     volumes:
       - .:/workspace:ro
       - peerless-cargo:/cargo
       - peerless-target:/target
       - node-b-data:/data
     networks: [peerless]
+    environment:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "false"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev"]
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2.0
 
   node-c:
+    image: peerless-development:local
+    pull_policy: never
     build:
       context: .
       target: development
     working_dir: /workspace
-    command: cargo run -p peerless-cli -- start /data /ip4/0.0.0.0/udp/9718/quic-v1
+    command: cargo run -p peerless-cli -- start --unsafe-open /data /ip4/0.0.0.0/udp/9718/quic-v1
     volumes:
       - .:/workspace:ro
       - peerless-cargo:/cargo
       - peerless-target:/target
       - node-c-data:/data
     networks: [peerless]
+    environment:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "false"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev"]
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2.0
 
 networks:
   build: {}

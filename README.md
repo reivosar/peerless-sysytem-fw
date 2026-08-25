@@ -40,7 +40,7 @@ runtime.
 
 | Problem | Runtime mechanism |
 |---|---|
-| Nodes appear and disappear | mDNS, static bootstrap, Identify, peer cache, TTLs, leases |
+| Nodes appear and disappear | Signed invitations, explicit bootstrap, peer cache, TTLs, leases |
 | WAN peers and content are hard to locate | Kademlia routing and provider discovery |
 | NAT prevents direct connectivity | AutoNAT, Circuit Relay v2, and DCUtR |
 | Placement becomes centralized | Per-requester adaptive scheduler |
@@ -76,7 +76,7 @@ flowchart TB
     CAP --> MESH
     QUORUM --> MESH
     WASM --> MESH
-    MESH --> LAN[mDNS]
+    MESH --> BOOT[Invitation bootstrap and peer cache]
     MESH --> WAN[Kademlia and Identify]
     MESH --> DIRECT[QUIC or TCP plus Noise]
     MESH --> NAT[AutoNAT and DCUtR]
@@ -107,13 +107,43 @@ which keeps transport, consensus, and execution policies replaceable.
 
 Each node generates one persistent Ed25519 keypair. The same key establishes
 the libp2p Peer ID and signs versioned protocol envelopes. The peerless Node ID
-is derived from the encoded public key. Responses are bound to the connected
-libp2p identity, so a valid response signed by a different peer is rejected.
+is derived from the encoded public key. Requests and responses are bound to the
+connected libp2p identity, so a valid envelope relayed by a different transport
+peer is rejected.
 
 Identity is not membership. A permissioned mesh installs certificates issued
 by trusted members. A certificate binds network ID, member ID, permissions,
 expiry, issuer, and signature. Nodes enforce permissions separately for
 observation, content, execution, state, and ledger operations.
+
+The normal listener is closed by default: it refuses to start until the node is
+initialised or has joined a signed permissioned network. `--unsafe-open` is
+reserved for an isolated test network such as the Docker E2E environment.
+
+~~~bash
+peerless init peerless-data my-network
+peerless start peerless-data /ip4/0.0.0.0/udp/9718/quic-v1
+~~~
+
+## Source-address privacy and hardening
+
+Direct P2P necessarily reveals endpoint addresses to the two peers. When that
+is unacceptable, start a member through a trusted circuit relay:
+
+~~~bash
+peerless start-relayed peerless-data \
+  /dns4/relay-a.example/tcp/9718/p2p/RELAY_A_PEER_ID \
+  /dns4/relay-b.example/tcp/9718/p2p/RELAY_B_PEER_ID
+~~~
+
+Relay-only mode disables ambient discovery, Identify, AutoNAT, and DCUtR,
+requires its base listener to be loopback-only, accepts circuit paths only
+through explicitly configured relays, rejects direct peer addresses/listeners/
+dials, and therefore prevents an application peer
+from learning the other endpoint's direct IP. Each selected relay still sees
+the network endpoints using it; Peerless does not claim anonymity from a relay or a global
+traffic observer. See [SECURITY.md](SECURITY.md) for the exact guarantee,
+remaining risks, key protection, runtime limits, and deployment requirements.
 
 ## Network
 
@@ -121,7 +151,7 @@ Each native peer libp2p Swarm contains:
 
 - QUIC as the preferred native transport;
 - TCP secured by Noise with Yamux as fallback;
-- mDNS for authority-free LAN discovery;
+- explicit invitation/bootstrap addresses (ambient mDNS discovery is disabled);
 - Kademlia for WAN routing and ContentId-to-provider lookup;
 - signed Gossipsub for state and ledger propagation;
 - Identify and Ping;
@@ -138,8 +168,8 @@ The `peerless-browser` crate compiles for `wasm32-unknown-unknown` and construct
 real WebTransport, WebRTC, and WebSocket+Noise+Yamux transports. Browser peers
 use the same identity and signed protocol types as native peers.
 
-Static multiaddresses, LAN discovery, invitation data, and cached peers can
-bootstrap a node. Cached addresses live under metadata/known-peers.json.
+Static multiaddresses, invitation data, and cached peers can bootstrap a node.
+Cached addresses live under metadata/known-peers.json.
 Bootstrap nodes introduce peers but have no authority over the established
 mesh.
 
@@ -298,17 +328,13 @@ docker compose run --rm dev cargo build \\
   --manifest-path examples/double-wasm/Cargo.toml \\
   --target wasm32-unknown-unknown --release
 
-docker compose run --rm dev cargo run -p peerless-cli -- peers /tmp/observer
-docker compose run --rm dev cargo run -p peerless-cli -- run \\
-  /tmp/requester \\
-  /target/wasm32-unknown-unknown/release/double.wasm \\
-  21
+./scripts/e2e.sh
 
 docker compose run --rm dev cargo run -p peerless-cli -- demo-images \\
   /workspace/demo-output 100
 ~~~
 
-The demo discovers three nodes, exchanges capabilities, places the task,
+The E2E connects three nodes by explicit multiaddress, exchanges capabilities, places the task,
 transfers verified content, executes remotely, writes an audit block, and
 returns 42 with a verified signature.
 
@@ -322,7 +348,9 @@ the evidence records that invariant and all signed outputs.
 ## CLI
 
 ~~~text
-peerless start [DATA] [QUIC_MULTIADDR]
+peerless init DATA NETWORK
+peerless start [--unsafe-open] [DATA] [QUIC_MULTIADDR]
+peerless start-relayed DATA RELAY_MULTIADDR [RELAY_MULTIADDR...]
 peerless identity [DATA]
 peerless invite DATA NETWORK MEMBER OUTPUT [BOOTSTRAP...]
 peerless join DATA INVITATION
@@ -330,7 +358,7 @@ peerless qr INVITATION
 peerless peers [DATA]
 peerless status [DATA]
 peerless inspect peers|tasks|storage|ledger [DATA]
-peerless run DATA WASM INTEGER [QUIC_MULTIADDR/p2p/PEER_ID ...]
+peerless run [--unsafe-open] DATA WASM INTEGER [QUIC_MULTIADDR/p2p/PEER_ID ...]
 peerless e2e-features [DATA]
 peerless demo-images [DATA] [COUNT]
 ~~~
@@ -366,8 +394,9 @@ network before runtime verification. It then:
 8. runs the public application APIs five times with independent state over real
    sockets for DHT content fetch,
    signed CRDT convergence, membership rejection, replica repair, 3-of-4 BFT
-   finality, ledger gossip, Relay v2, DCUtR, and direct communication after relay
-   departure;
+   finality, ledger gossip, Relay v2, DCUtR, relay-only source-address privacy,
+   direct-path rejection, Wasm fuel exhaustion, rate/connection limits, and
+   direct communication after relay in non-private mode;
 9. runs every workspace test, including CRDT, membership, replication repair,
    BFT, tampering, AutoNAT, Relay v2, DCUtR, resource limits, and restart replay;
 10. compiles the browser transports for `wasm32-unknown-unknown`; and
@@ -376,7 +405,7 @@ network before runtime verification. It then:
 The final line must be:
 
 ~~~text
-result=PASS server_free=true runtime_network_internal=true falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true
+result=PASS server_free=true runtime_network_internal=true secure_default=true relay_privacy=true wasm_fuel=true rate_limit=true connection_limit=true key_permissions=true container_hardened=true falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true
 ~~~
 
 The concise execution trace is written to `e2e-output/latest.txt`. A failed
@@ -401,7 +430,7 @@ substitution; requester spoofing and commit theft; Task ID replay; unrelated
 signed results; resource boundaries; denied WASM host imports; corrupt CAS;
 Kademlia provider discovery; signed Gossipsub; CRDT partition and merge;
 membership expiry and permissions; distinct-member quorum; Merkle tampering;
-ledger persistence and replication; QUIC RPC; mDNS; replication policy; and
+ledger persistence and replication; QUIC RPC; explicit bootstrap; replication policy; and
 restart persistence. It also performs real AutoNAT dial-back classification,
 Relay v2 reservation and circuit RPC, successful DCUtR upgrade, corrupt chunk
 rejection, departed-executor replacement, three-distinct-executor verification,
@@ -413,6 +442,7 @@ BFT leader/quorum rejection, SQLite recovery, and restart-safe TaskId replay.
 |---|---|
 | Chunked large-object transfer | `large_content_is_chunked_and_corrupt_chunks_are_rejected` |
 | Invitation, QR, and bootstrap persistence | `invitation_is_bound_to_member_network_and_expiry`; `invitation_persists_membership_and_bootstraps_the_issuer` |
+| Immediate and restart-persistent member revocation | `finalized_revocation_blocks_member_immediately_and_after_restart` |
 | SQLite Task/Peer/Reputation/Event metadata | `node_exposes_persistent_state_storage_and_task_observability` |
 | Atomic concurrent reputation accounting | `concurrent_reputation_updates_are_not_lost` |
 | Peer-first requester load relief | `execute_best_offloads_to_an_eligible_peer_before_using_local_compute` |
@@ -429,6 +459,7 @@ BFT leader/quorum rejection, SQLite recovery, and restart-safe TaskId replay.
 | Relay and DCUtR | `circuit_relay_reservation_carries_rpc_between_private_peers` asserts reservation, circuit RPC, successful hole punch, relay shutdown, and continued direct RPC |
 | Public application feature boundary | `peerless e2e-features ...` exercises content, CRDT, membership, replication repair, BFT ledger gossip, Relay, and DCUtR through exported APIs over live sockets |
 | Browser transports | Docker `cargo check -p peerless-browser --target wasm32-unknown-unknown` |
+| Known dependency vulnerabilities | Docker `cargo audit` and the scheduled Security workflow |
 | 100-image distributed resize | `peerless demo-images ... 100`, 100 verified outputs, zero requester executions, two executor ledgers, and `evidence.json` |
 
 The final audit is intentionally adversarial in five passes: cryptographic and

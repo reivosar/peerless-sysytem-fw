@@ -19,6 +19,9 @@ pub enum LedgerEvent {
     NodeJoined {
         member: NodeId,
     },
+    NodeRevoked {
+        member: NodeId,
+    },
     TaskCreated {
         task_id: String,
     },

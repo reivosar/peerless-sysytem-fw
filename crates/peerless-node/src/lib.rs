@@ -36,6 +36,9 @@ const MAX_ACTIVE_UPLOADS: usize = 4;
 const MAX_IN_FLIGHT_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const HOST_MEMORY_RESERVE: u64 = 1024 * 1024 * 1024;
 const MAX_CONCURRENT_TASKS: usize = 1;
+const REQUEST_WINDOW_MILLIS: u64 = 60_000;
+const MAX_REQUESTS_PER_IDENTITY_PER_WINDOW: u32 = 4_096;
+const MAX_REQUESTS_GLOBAL_PER_WINDOW: u32 = 16_384;
 
 #[derive(Debug, Error)]
 pub enum NodeError {
@@ -57,6 +60,8 @@ pub enum NodeError {
     UnexpectedResponse,
     #[error("libp2p failed: {0}")]
     P2p(String),
+    #[error("network membership is required; initialise or join a network before listening")]
+    MembershipRequired,
     #[error("replication target was not met: {actual} replicas, minimum {minimum}")]
     InsufficientReplicas { actual: usize, minimum: u8 },
     #[error(transparent)]
@@ -76,11 +81,15 @@ struct Inner {
     state: StateStore,
     ledger: Mutex<Ledger>,
     membership: RwLock<Option<MembershipPolicy>>,
+    issued_memberships: Mutex<Vec<Membership>>,
+    revoked_members: RwLock<HashSet<NodeId>>,
+    request_budget: Mutex<RequestBudget>,
     uploads: Mutex<HashMap<(NodeId, ContentId), UploadSession>>,
     metadata: Metadata,
     temporary: PathBuf,
     peer_cache: PathBuf,
     membership_file: PathBuf,
+    issued_memberships_file: PathBuf,
 }
 struct UploadSession {
     total_size: u64,
@@ -100,7 +109,22 @@ struct CompletedTask {
 }
 struct MembershipPolicy {
     network_id: String,
-    permissions: HashMap<NodeId, std::collections::HashSet<String>>,
+    permissions: HashMap<NodeId, MemberAccess>,
+}
+struct MemberAccess {
+    permissions: HashSet<String>,
+    expires_at: Option<u64>,
+}
+impl MemberAccess {
+    fn allows(&self, permission: &str, at: u64) -> bool {
+        self.expires_at.is_none_or(|expiry| expiry > at)
+            && (self.permissions.contains("*") || self.permissions.contains(permission))
+    }
+}
+struct RequestBudget {
+    window_started_at: u64,
+    global: u32,
+    identities: HashMap<NodeId, u32>,
 }
 #[derive(Clone)]
 pub struct PeerlessNode {
@@ -150,6 +174,9 @@ impl Peerless {
         }
     }
     pub fn start(&self) -> Result<P2pRpc, NodeError> {
+        if !self.node.has_membership() {
+            return Err(NodeError::MembershipRequired);
+        }
         self.node.serve_p2p(self.listen.clone())
     }
     pub fn content(&self) -> ContentApi<'_> {
@@ -275,11 +302,19 @@ impl PeerlessNode {
                 state: StateStore::open(data.join("state/documents"))?,
                 ledger: Mutex::new(Ledger::open(data.join("ledger/blocks"))?),
                 membership: RwLock::new(None),
+                issued_memberships: Mutex::new(Vec::new()),
+                revoked_members: RwLock::new(HashSet::new()),
+                request_budget: Mutex::new(RequestBudget {
+                    window_started_at: now(),
+                    global: 0,
+                    identities: HashMap::new(),
+                }),
                 uploads: Mutex::new(HashMap::new()),
                 metadata,
                 temporary,
                 peer_cache: data.join("metadata/known-peers.json"),
                 membership_file: data.join("metadata/membership-invitation.json"),
+                issued_memberships_file: data.join("metadata/issued-memberships.json"),
             }),
         };
         if node.inner.membership_file.exists() {
@@ -288,6 +323,15 @@ impl PeerlessNode {
                     .map_err(ProtocolError::from)?;
             node.activate_invitation(&invitation, now())?;
         }
+        if node.inner.issued_memberships_file.exists() {
+            let memberships: Vec<Membership> =
+                serde_json::from_slice(&std::fs::read(&node.inner.issued_memberships_file)?)
+                    .map_err(ProtocolError::from)?;
+            for membership in memberships {
+                node.register_issued_membership(membership, now(), false)?;
+            }
+        }
+        node.refresh_revocations_from_ledger();
         Ok(node)
     }
     pub fn node_id(&self) -> &NodeId {
@@ -301,7 +345,7 @@ impl PeerlessNode {
         expires_at: Option<u64>,
         bootstrap: Vec<String>,
     ) -> Result<Invitation, NodeError> {
-        Ok(Invitation::issue(
+        let invitation = Invitation::issue(
             network_id.into(),
             member,
             permissions,
@@ -309,7 +353,11 @@ impl PeerlessNode {
             bootstrap,
             now(),
             &self.inner.identity,
-        )?)
+        )?;
+        if self.has_membership() {
+            self.register_issued_membership(invitation.membership.clone(), now(), true)?;
+        }
+        Ok(invitation)
     }
     pub fn install_invitation(&self, invitation: &Invitation, at: u64) -> Result<(), NodeError> {
         if !invitation.verify_for(self.node_id(), at, &self.inner.temporary)? {
@@ -337,7 +385,100 @@ impl PeerlessNode {
             std::slice::from_ref(&invitation.membership),
             &std::collections::HashSet::from([invitation.membership.issuer.clone()]),
             at,
-        )
+        )?;
+        self.inner
+            .membership
+            .write()
+            .expect("membership lock poisoned")
+            .as_mut()
+            .expect("membership was just installed")
+            .permissions
+            .insert(
+                invitation.membership.issuer.clone(),
+                MemberAccess {
+                    permissions: HashSet::from(["*".into()]),
+                    expires_at: invitation.membership.expires_at,
+                },
+            );
+        Ok(())
+    }
+
+    fn register_issued_membership(
+        &self,
+        membership: Membership,
+        at: u64,
+        persist: bool,
+    ) -> Result<(), NodeError> {
+        if self
+            .inner
+            .revoked_members
+            .read()
+            .expect("revoked members lock poisoned")
+            .contains(&membership.member)
+        {
+            return Err(NodeError::Rejected("member has been revoked".into()));
+        }
+        if membership.issuer != *self.node_id()
+            || !membership.verify(
+                &HashSet::from([self.node_id().clone()]),
+                at,
+                &self.inner.temporary,
+            )?
+        {
+            return Err(NodeError::Rejected(
+                "issued membership is not a valid local certificate".into(),
+            ));
+        }
+        let mut policy = self
+            .inner
+            .membership
+            .write()
+            .expect("membership lock poisoned");
+        let active = policy.as_mut().ok_or(NodeError::MembershipRequired)?;
+        if active.network_id != membership.network_id {
+            return Err(NodeError::Rejected(
+                "issued membership belongs to another network".into(),
+            ));
+        }
+        active.permissions.insert(
+            membership.member.clone(),
+            MemberAccess {
+                permissions: membership.permissions.iter().cloned().collect(),
+                expires_at: membership.expires_at,
+            },
+        );
+        drop(policy);
+        let mut issued = self
+            .inner
+            .issued_memberships
+            .lock()
+            .expect("issued memberships lock poisoned");
+        if let Some(known) = issued
+            .iter_mut()
+            .find(|known| known.member == membership.member)
+        {
+            *known = membership;
+        } else {
+            issued.push(membership);
+        }
+        if persist {
+            if let Some(parent) = self.inner.issued_memberships_file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(
+                &self.inner.issued_memberships_file,
+                serde_json::to_vec_pretty(&*issued).map_err(ProtocolError::from)?,
+            )?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    &self.inner.issued_memberships_file,
+                    std::fs::Permissions::from_mode(0o600),
+                )?;
+            }
+        }
+        Ok(())
     }
     pub fn apply_invitation_bootstrap(
         &self,
@@ -436,9 +577,11 @@ impl PeerlessNode {
                 .expect("membership lock poisoned")
                 .as_ref()
             {
-                if !policy.permissions.get(&signer).is_some_and(|permissions| {
-                    permissions.contains("*") || permissions.contains("state")
-                }) {
+                if !policy
+                    .permissions
+                    .get(&signer)
+                    .is_some_and(|access| access.allows("state", now()))
+                {
                     continue;
                 }
             }
@@ -461,12 +604,68 @@ impl PeerlessNode {
         block: Block,
         consensus: &impl ConsensusEngine,
     ) -> Result<(), NodeError> {
+        let revocations = block
+            .events
+            .iter()
+            .filter_map(|event| match &event.event {
+                LedgerEvent::NodeRevoked { member } => Some((member.clone(), true)),
+                LedgerEvent::NodeJoined { member } => Some((member.clone(), false)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         self.inner
             .ledger
             .lock()
             .expect("ledger lock poisoned")
             .append(block, consensus, &self.inner.temporary)?;
+        self.apply_revocations(revocations);
         Ok(())
+    }
+
+    fn refresh_revocations_from_ledger(&self) {
+        let changes = self
+            .inner
+            .ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .blocks()
+            .iter()
+            .flat_map(|block| &block.events)
+            .filter_map(|event| match &event.event {
+                LedgerEvent::NodeRevoked { member } => Some((member.clone(), true)),
+                LedgerEvent::NodeJoined { member } => Some((member.clone(), false)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.apply_revocations(changes);
+    }
+
+    fn apply_revocations(&self, changes: Vec<(NodeId, bool)>) {
+        let mut revoked = self
+            .inner
+            .revoked_members
+            .write()
+            .expect("revoked members lock poisoned");
+        for (member, is_revoked) in changes {
+            if is_revoked {
+                revoked.insert(member);
+            } else {
+                revoked.remove(&member);
+            }
+        }
+        let revoked_snapshot = revoked.clone();
+        drop(revoked);
+        if let Some(policy) = self
+            .inner
+            .membership
+            .write()
+            .expect("membership lock poisoned")
+            .as_mut()
+        {
+            policy
+                .permissions
+                .retain(|member, _| !revoked_snapshot.contains(member));
+        }
     }
     pub fn publish_ledger_block(&self, network: &P2pRpc, block: &Block) -> Result<(), NodeError> {
         let message = Message::LedgerBlock {
@@ -501,9 +700,11 @@ impl PeerlessNode {
                 .expect("membership lock poisoned")
                 .as_ref()
             {
-                if !policy.permissions.get(&signer).is_some_and(|permissions| {
-                    permissions.contains("*") || permissions.contains("ledger")
-                }) {
+                if !policy
+                    .permissions
+                    .get(&signer)
+                    .is_some_and(|access| access.allows("ledger", now()))
+                {
                     continue;
                 }
             }
@@ -557,7 +758,10 @@ impl PeerlessNode {
             {
                 permissions.insert(
                     certificate.member.clone(),
-                    certificate.permissions.iter().cloned().collect(),
+                    MemberAccess {
+                        permissions: certificate.permissions.iter().cloned().collect(),
+                        expires_at: certificate.expires_at,
+                    },
                 );
             }
         }
@@ -570,6 +774,23 @@ impl PeerlessNode {
             permissions,
         });
         Ok(())
+    }
+    pub fn has_membership(&self) -> bool {
+        self.inner
+            .membership
+            .read()
+            .expect("membership lock poisoned")
+            .as_ref()
+            .and_then(|policy| policy.permissions.get(self.node_id()))
+            .is_some_and(|access| access.expires_at.is_none_or(|expiry| expiry > now()))
+    }
+    pub fn membership_network_id(&self) -> Option<String> {
+        self.inner
+            .membership
+            .read()
+            .expect("membership lock poisoned")
+            .as_ref()
+            .map(|policy| policy.network_id.clone())
     }
     pub fn replicate_p2p(
         &self,
@@ -663,16 +884,50 @@ impl PeerlessNode {
         })
     }
     pub fn serve(&self, bind: SocketAddr) -> Result<RpcServer, NodeError> {
+        if !self.has_membership() {
+            return Err(NodeError::MembershipRequired);
+        }
+        self.serve_unrestricted(bind)
+    }
+    /// Opens the legacy TCP RPC listener without admission. Use only inside an
+    /// already isolated test network.
+    pub fn serve_unrestricted(&self, bind: SocketAddr) -> Result<RpcServer, NodeError> {
         let node = self.clone();
         Ok(RpcServer::start_on(bind, move |message| {
             node.handle_or_reject(message)
         })?)
     }
     pub fn serve_p2p(&self, listen: Multiaddr) -> Result<P2pRpc, NodeError> {
+        if !self.has_membership() {
+            return Err(NodeError::MembershipRequired);
+        }
+        self.serve_p2p_unrestricted(listen)
+    }
+    /// Opens an admission-free listener. This is only appropriate for an
+    /// isolated test mesh whose network boundary already excludes attackers.
+    pub fn serve_p2p_unrestricted(&self, listen: Multiaddr) -> Result<P2pRpc, NodeError> {
         let node = self.clone();
-        let network = P2pRpc::start(self.inner.identity.keypair(), listen, move |message| {
-            node.handle_or_reject(message)
-        })
+        let network = P2pRpc::start_bound(
+            self.inner.identity.keypair(),
+            listen,
+            move |peer, message| node.handle_p2p_or_reject(peer, message),
+        )
+        .map_err(NodeError::P2p)?;
+        network
+            .load_peer_cache(&self.inner.peer_cache)
+            .map_err(NodeError::P2p)?;
+        Ok(network)
+    }
+    pub fn serve_p2p_relay_private(&self, listen: Multiaddr) -> Result<P2pRpc, NodeError> {
+        if !self.has_membership() {
+            return Err(NodeError::MembershipRequired);
+        }
+        let node = self.clone();
+        let network = P2pRpc::start_relay_private_bound(
+            self.inner.identity.keypair(),
+            listen,
+            move |peer, message| node.handle_p2p_or_reject(peer, message),
+        )
         .map_err(NodeError::P2p)?;
         network
             .load_peer_cache(&self.inner.peer_cache)
@@ -687,6 +942,15 @@ impl PeerlessNode {
     pub fn handle(&self, envelope: SignedEnvelope) -> Result<SignedEnvelope, NodeError> {
         let (message, signer): (Message, NodeId) =
             envelope.open_with_signer(&self.inner.temporary)?;
+        if !self.consume_request_budget(&signer, now()) {
+            return Ok(SignedEnvelope::seal(
+                &Message::TaskReject {
+                    task_id: String::new(),
+                    reason: "request rate limit exceeded".into(),
+                },
+                &self.inner.identity,
+            )?);
+        }
         if let Some(policy) = self
             .inner
             .membership
@@ -695,9 +959,10 @@ impl PeerlessNode {
             .as_ref()
         {
             let required = permission_for(&message);
-            let allowed = policy.permissions.get(&signer).is_some_and(|permissions| {
-                permissions.contains("*") || permissions.contains(required)
-            });
+            let allowed = policy
+                .permissions
+                .get(&signer)
+                .is_some_and(|access| access.allows(required, now()));
             if !allowed {
                 return Ok(SignedEnvelope::seal(
                     &Message::TaskReject {
@@ -862,6 +1127,29 @@ impl PeerlessNode {
             other => other,
         };
         Ok(SignedEnvelope::seal(&response, &self.inner.identity)?)
+    }
+
+    fn consume_request_budget(&self, signer: &NodeId, at: u64) -> bool {
+        let mut budget = self
+            .inner
+            .request_budget
+            .lock()
+            .expect("request budget lock poisoned");
+        if at.saturating_sub(budget.window_started_at) >= REQUEST_WINDOW_MILLIS {
+            budget.window_started_at = at;
+            budget.global = 0;
+            budget.identities.clear();
+        }
+        if budget.global >= MAX_REQUESTS_GLOBAL_PER_WINDOW {
+            return false;
+        }
+        let count = budget.identities.entry(signer.clone()).or_default();
+        if *count >= MAX_REQUESTS_PER_IDENTITY_PER_WINDOW {
+            return false;
+        }
+        *count += 1;
+        budget.global += 1;
+        true
     }
 
     pub fn capability(&self) -> NodeCapability {
@@ -1141,6 +1429,22 @@ impl PeerlessNode {
             )
             .expect("local signing failed")
         })
+    }
+    fn handle_p2p_or_reject(&self, peer: PeerId, envelope: SignedEnvelope) -> SignedEnvelope {
+        let transport_matches =
+            libp2p::identity::PublicKey::try_decode_protobuf(&envelope.public_key)
+                .is_ok_and(|public| public.to_peer_id() == peer);
+        if transport_matches {
+            return self.handle_or_reject(envelope);
+        }
+        SignedEnvelope::seal(
+            &Message::TaskReject {
+                task_id: String::new(),
+                reason: "signed request identity differs from connected peer".into(),
+            },
+            &self.inner.identity,
+        )
+        .expect("local signing failed")
     }
     pub fn remote_execute(
         &self,
@@ -1622,14 +1926,25 @@ mod tests {
         let requester = PeerlessNode::open(root.path().join("requester")).unwrap();
         let executor = PeerlessNode::open(root.path().join("executor")).unwrap();
         let listen: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
-        let requester_network = requester.serve_p2p(listen.clone()).unwrap();
-        let executor_network = executor.serve_p2p(listen).unwrap();
+        let requester_network = requester.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let executor_network = executor.serve_p2p_unrestricted(listen).unwrap();
         requester_network
             .add_peer(
                 executor_network.peer_id(),
                 executor_network.listen_address().clone(),
             )
             .unwrap();
+        let forged = PeerlessNode::open(root.path().join("forged-transport-signer")).unwrap();
+        let forged_request =
+            SignedEnvelope::seal(&Message::GetCapability, &forged.inner.identity).unwrap();
+        let forged_response: Message = requester_network
+            .request(executor_network.peer_id(), forged_request)
+            .unwrap()
+            .open(root.path())
+            .unwrap();
+        assert!(
+            matches!(forged_response, Message::TaskReject { reason, .. } if reason.contains("connected peer"))
+        );
         let capability = requester
             .peer_capability_p2p(&requester_network, executor_network.peer_id())
             .unwrap();
@@ -1693,8 +2008,8 @@ mod tests {
         let requester = PeerlessNode::open(root.path().join("offload-requester")).unwrap();
         let executor = PeerlessNode::open(root.path().join("offload-executor")).unwrap();
         let listen: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
-        let requester_network = requester.serve_p2p(listen.clone()).unwrap();
-        let executor_network = executor.serve_p2p(listen).unwrap();
+        let requester_network = requester.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let executor_network = executor.serve_p2p_unrestricted(listen).unwrap();
         requester_network
             .add_peer(
                 executor_network.peer_id(),
@@ -1719,9 +2034,9 @@ mod tests {
         let first = PeerlessNode::open(root.path().join("pool-first")).unwrap();
         let second = PeerlessNode::open(root.path().join("pool-second")).unwrap();
         let listen: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
-        let requester_network = requester.serve_p2p(listen.clone()).unwrap();
-        let first_network = first.serve_p2p(listen.clone()).unwrap();
-        let second_network = second.serve_p2p(listen).unwrap();
+        let requester_network = requester.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let first_network = first.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let second_network = second.serve_p2p_unrestricted(listen).unwrap();
         for network in [&first_network, &second_network] {
             requester_network
                 .add_peer(network.peer_id(), network.listen_address().clone())
@@ -2113,8 +2428,8 @@ mod tests {
         let executor_path = root.path().join("restart-executor");
         let executor = PeerlessNode::open(&executor_path).unwrap();
         let listen: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
-        let requester_network = requester.serve_p2p(listen.clone()).unwrap();
-        let executor_network = executor.serve_p2p(listen.clone()).unwrap();
+        let requester_network = requester.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let executor_network = executor.serve_p2p_unrestricted(listen.clone()).unwrap();
         requester_network
             .add_peer(
                 executor_network.peer_id(),
@@ -2137,7 +2452,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let reopened = PeerlessNode::open(&executor_path).unwrap();
-        let reopened_network = reopened.serve_p2p(listen).unwrap();
+        let reopened_network = reopened.serve_p2p_unrestricted(listen).unwrap();
         assert_eq!(reopened_network.peer_id(), executor_peer);
         requester_network
             .add_peer(executor_peer, reopened_network.listen_address().clone())
@@ -2167,6 +2482,17 @@ mod tests {
         let mut state = runtime.state().open("api-state").unwrap();
         state.put("ready", "yes").unwrap();
         state.save().unwrap();
+        let genesis = runtime
+            .node()
+            .issue_invitation(
+                "api-mesh",
+                runtime.node().node_id().clone(),
+                vec!["*".into()],
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        runtime.node().install_invitation(&genesis, now()).unwrap();
         let network = runtime.start().unwrap();
         let (record, output) = runtime
             .compute()
@@ -2240,8 +2566,8 @@ mod tests {
         let first = PeerlessNode::open(root.path().join("first")).unwrap();
         let second = PeerlessNode::open(root.path().join("second")).unwrap();
         let listen: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
-        let first_network = first.serve_p2p(listen.clone()).unwrap();
-        let second_network = second.serve_p2p(listen).unwrap();
+        let first_network = first.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let second_network = second.serve_p2p_unrestricted(listen).unwrap();
         first_network
             .add_peer(
                 second_network.peer_id(),
@@ -2320,8 +2646,8 @@ mod tests {
             .unwrap();
 
         let listen: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
-        let first_network = first.serve_p2p(listen.clone()).unwrap();
-        let second_network = second.serve_p2p(listen).unwrap();
+        let first_network = first.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let second_network = second.serve_p2p_unrestricted(listen).unwrap();
         first_network
             .add_peer(
                 second_network.peer_id(),
@@ -2454,7 +2780,7 @@ mod tests {
         let member_path = root.path().join("invite-member");
         let member = PeerlessNode::open(&member_path).unwrap();
         let issuer_network = issuer
-            .serve_p2p("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .serve_p2p_unrestricted("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
             .unwrap();
         let bootstrap = format!(
             "{}/p2p/{}",
@@ -2490,6 +2816,153 @@ mod tests {
     }
 
     #[test]
+    fn issued_membership_is_bidirectional_persistent_and_expires_while_running() {
+        let root = tempfile::tempdir().unwrap();
+        let issuer_path = root.path().join("secure-issuer");
+        let member_path = root.path().join("secure-member");
+        let issuer = PeerlessNode::open(&issuer_path).unwrap();
+        let genesis = issuer
+            .issue_invitation(
+                "secure-mesh",
+                issuer.node_id().clone(),
+                vec!["*".into()],
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        issuer.install_invitation(&genesis, now()).unwrap();
+        let member = PeerlessNode::open(&member_path).unwrap();
+        let invitation = issuer
+            .issue_invitation(
+                "secure-mesh",
+                member.node_id().clone(),
+                vec!["*".into()],
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        member.install_invitation(&invitation, now()).unwrap();
+        drop(member);
+        drop(issuer);
+
+        let issuer = PeerlessNode::open(&issuer_path).unwrap();
+        let member = PeerlessNode::open(&member_path).unwrap();
+        let listen: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
+        let issuer_network = issuer.serve_p2p(listen.clone()).unwrap();
+        let member_network = member.serve_p2p(listen).unwrap();
+        issuer_network
+            .add_peer(
+                member_network.peer_id(),
+                member_network.listen_address().clone(),
+            )
+            .unwrap();
+        member_network
+            .add_peer(
+                issuer_network.peer_id(),
+                issuer_network.listen_address().clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            issuer
+                .peer_capability_p2p(&issuer_network, member_network.peer_id())
+                .unwrap()
+                .node,
+            *member.node_id()
+        );
+        assert_eq!(
+            member
+                .peer_capability_p2p(&member_network, issuer_network.peer_id())
+                .unwrap()
+                .node,
+            *issuer.node_id()
+        );
+
+        let expiring_path = root.path().join("expiring-member");
+        let expiring = PeerlessNode::open(&expiring_path).unwrap();
+        let expiry = now() + 20;
+        let expiring_invitation = issuer
+            .issue_invitation(
+                "secure-mesh",
+                expiring.node_id().clone(),
+                vec!["*".into()],
+                Some(expiry),
+                Vec::new(),
+            )
+            .unwrap();
+        expiring
+            .install_invitation(&expiring_invitation, now())
+            .unwrap();
+        assert!(expiring.has_membership());
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(!expiring.has_membership());
+    }
+
+    #[test]
+    fn finalized_revocation_blocks_member_immediately_and_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let issuer_path = root.path().join("revocation-issuer");
+        let issuer = PeerlessNode::open(&issuer_path).unwrap();
+        let genesis = issuer
+            .issue_invitation(
+                "revocation-mesh",
+                issuer.node_id().clone(),
+                vec!["*".into()],
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        issuer.install_invitation(&genesis, now()).unwrap();
+        let member = PeerlessNode::open(root.path().join("revoked-member")).unwrap();
+        issuer
+            .issue_invitation(
+                "revocation-mesh",
+                member.node_id().clone(),
+                vec!["*".into()],
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+
+        let consensus = QuorumConsensus::new(
+            "revocation-mesh",
+            HashSet::from([issuer.node_id().clone()]),
+            1,
+        )
+        .unwrap();
+        let event = SignedEvent::seal(
+            LedgerEvent::NodeRevoked {
+                member: member.node_id().clone(),
+            },
+            &issuer.inner.identity,
+        )
+        .unwrap();
+        let mut block = issuer
+            .inner
+            .ledger
+            .lock()
+            .unwrap()
+            .next_block(vec![event], now(), "revocation-mesh")
+            .unwrap();
+        consensus
+            .finalize(&mut block, &[&issuer.inner.identity])
+            .unwrap();
+        issuer.append_ledger_block(block, &consensus).unwrap();
+
+        let request =
+            || SignedEnvelope::seal(&Message::GetCapability, &member.inner.identity).unwrap();
+        let response: Message = issuer.handle(request()).unwrap().open(root.path()).unwrap();
+        assert!(matches!(response, Message::TaskReject { .. }));
+        drop(issuer);
+        let reopened = PeerlessNode::open(&issuer_path).unwrap();
+        let response: Message = reopened
+            .handle(request())
+            .unwrap()
+            .open(root.path())
+            .unwrap();
+        assert!(matches!(response, Message::TaskReject { .. }));
+    }
+
+    #[test]
     fn replication_is_repaired_after_an_executor_disappears() {
         let root = tempfile::tempdir().unwrap();
         let owner = PeerlessNode::open(root.path().join("repair-owner")).unwrap();
@@ -2497,10 +2970,10 @@ mod tests {
         let c = PeerlessNode::open(root.path().join("repair-c")).unwrap();
         let d = PeerlessNode::open(root.path().join("repair-d")).unwrap();
         let listen: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
-        let owner_network = owner.serve_p2p(listen.clone()).unwrap();
-        let b_network = b.serve_p2p(listen.clone()).unwrap();
-        let c_network = c.serve_p2p(listen.clone()).unwrap();
-        let d_network = d.serve_p2p(listen).unwrap();
+        let owner_network = owner.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let b_network = b.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let c_network = c.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let d_network = d.serve_p2p_unrestricted(listen).unwrap();
         for network in [&b_network, &c_network, &d_network] {
             owner_network
                 .add_peer(network.peer_id(), network.listen_address().clone())
@@ -2541,7 +3014,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let owner = PeerlessNode::open(root.path().join("policy-owner")).unwrap();
         let network = owner
-            .serve_p2p("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .serve_p2p_unrestricted("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
             .unwrap();
         let id = owner.put(b"single-copy").unwrap();
         for policy in [
@@ -2592,11 +3065,11 @@ mod tests {
         let b = PeerlessNode::open(root.path().join("verify-b")).unwrap();
         let c = PeerlessNode::open(root.path().join("verify-c")).unwrap();
         let listen: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
-        let requester_network = requester.serve_p2p(listen.clone()).unwrap();
-        let dead_network = dead.serve_p2p(listen.clone()).unwrap();
-        let a_network = a.serve_p2p(listen.clone()).unwrap();
-        let b_network = b.serve_p2p(listen.clone()).unwrap();
-        let c_network = c.serve_p2p(listen).unwrap();
+        let requester_network = requester.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let dead_network = dead.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let a_network = a.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let b_network = b.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let c_network = c.serve_p2p_unrestricted(listen).unwrap();
         for network in [&dead_network, &a_network, &b_network, &c_network] {
             requester_network
                 .add_peer(network.peer_id(), network.listen_address().clone())
@@ -2631,5 +3104,44 @@ mod tests {
         assert_eq!(a.ledger_height(), 1);
         assert_eq!(b.ledger_height(), 1);
         assert_eq!(c.ledger_height(), 1);
+    }
+
+    #[test]
+    fn high_level_listener_requires_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let peerless = Peerless::builder()
+            .storage(root.path())
+            .listen("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .build()
+            .unwrap();
+        assert!(matches!(
+            peerless.start(),
+            Err(NodeError::MembershipRequired)
+        ));
+        assert!(matches!(
+            peerless.node().serve("127.0.0.1:0".parse().unwrap()),
+            Err(NodeError::MembershipRequired)
+        ));
+    }
+
+    #[test]
+    fn request_budget_limits_each_identity_and_the_global_window() {
+        let root = tempfile::tempdir().unwrap();
+        let node = PeerlessNode::open(root.path()).unwrap();
+        let started = now();
+        let first = NodeId::from_public_key_bytes(vec![1]);
+        for _ in 0..MAX_REQUESTS_PER_IDENTITY_PER_WINDOW {
+            assert!(node.consume_request_budget(&first, started));
+        }
+        assert!(!node.consume_request_budget(&first, started));
+        assert!(node.consume_request_budget(&first, started + REQUEST_WINDOW_MILLIS));
+
+        let second_window = started + REQUEST_WINDOW_MILLIS * 2;
+        for index in 0..MAX_REQUESTS_GLOBAL_PER_WINDOW {
+            let signer = NodeId::from_public_key_bytes((index / 4_000).to_le_bytes().to_vec());
+            assert!(node.consume_request_budget(&signer, second_window));
+        }
+        let extra = NodeId::from_public_key_bytes(vec![255; 8]);
+        assert!(!node.consume_request_budget(&extra, second_window));
     }
 }

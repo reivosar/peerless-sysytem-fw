@@ -1,4 +1,4 @@
-FROM rust:1.91-bookworm AS development
+FROM rust:1.94-bookworm AS development
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -20,10 +20,16 @@ RUN rustup component add rustfmt clippy \
     && ln -sf "$toolchain_bin/rustfmt" /usr/local/bin/rustfmt \
     && ln -sf "$toolchain_bin/cargo-fmt" /usr/local/bin/cargo-fmt \
     && ln -sf "$toolchain_bin/clippy-driver" /usr/local/bin/clippy-driver \
-    && ln -sf "$toolchain_bin/cargo-clippy" /usr/local/bin/cargo-clippy
+    && ln -sf "$toolchain_bin/cargo-clippy" /usr/local/bin/cargo-clippy \
+    && useradd --create-home --uid 10001 --shell /usr/sbin/nologin peerless \
+    && mkdir -p /cargo /target /workspace /data \
+    && chown -R peerless:peerless /cargo /target /workspace /data
+
+RUN cargo install cargo-audit --locked
 
 WORKDIR /workspace
 ENV CARGO_HOME=/cargo
 ENV CARGO_TARGET_DIR=/target
+USER 10001:10001
 
 CMD ["cargo", "test", "--workspace"]

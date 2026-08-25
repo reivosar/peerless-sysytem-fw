@@ -1,9 +1,13 @@
 //! Capability-free Wasmtime executor for an exported `run: (i32) -> i32`.
 
 use thiserror::Error;
-use wasmtime::{component, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    component, Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder,
+};
 
 use crate::DEFAULT_TASK_MEMORY_LIMIT;
+
+const DEFAULT_TASK_FUEL: u64 = 10_000_000;
 
 #[derive(Debug, Error)]
 pub enum WasmError {
@@ -35,7 +39,7 @@ pub struct PureBytesModule {
 
 impl PureBytesModule {
     pub fn parse(bytes: &[u8]) -> Result<Self, WasmError> {
-        let engine = Engine::default();
+        let engine = limited_engine()?;
         let module =
             Module::new(&engine, bytes).map_err(|error| WasmError::Invalid(error.to_string()))?;
         Ok(Self { engine, module })
@@ -56,7 +60,7 @@ impl PureBytesModule {
                 "input exceeds the task memory limit".into(),
             ));
         }
-        let mut store = limited_store(&self.engine, memory_limit);
+        let mut store = limited_store(&self.engine, memory_limit)?;
         let instance = Instance::new(&mut store, &self.module, &[])
             .map_err(|error| WasmError::Trap(error.to_string()))?;
         let memory = instance
@@ -93,7 +97,7 @@ impl PureBytesModule {
 
 impl PureI32Module {
     pub fn parse(bytes: &[u8]) -> Result<Self, WasmError> {
-        let engine = Engine::default();
+        let engine = limited_engine()?;
         if let Ok(value) = component::Component::new(&engine, bytes) {
             return Ok(Self {
                 engine,
@@ -121,7 +125,7 @@ impl PureI32Module {
             .map_err(|_| WasmError::Invalid("memory limit exceeds host address space".into()))?;
         match &self.compiled {
             Compiled::Component(compiled) => {
-                let mut store = limited_store(&self.engine, memory_limit);
+                let mut store = limited_store(&self.engine, memory_limit)?;
                 let linker = component::Linker::new(&self.engine);
                 let instance = linker
                     .instantiate(&mut store, compiled)
@@ -135,7 +139,7 @@ impl PureI32Module {
                 Ok(output)
             }
             Compiled::Module(compiled) => {
-                let mut store = limited_store(&self.engine, memory_limit);
+                let mut store = limited_store(&self.engine, memory_limit)?;
                 let instance = Instance::new(&mut store, compiled, &[])
                     .map_err(|error| WasmError::Trap(error.to_string()))?;
                 instance
@@ -148,11 +152,20 @@ impl PureI32Module {
     }
 }
 
-fn limited_store(engine: &Engine, memory_limit: usize) -> Store<StoreLimits> {
+fn limited_engine() -> Result<Engine, WasmError> {
+    let mut config = Config::new();
+    config.consume_fuel(true);
+    Engine::new(&config).map_err(|error| WasmError::Invalid(error.to_string()))
+}
+
+fn limited_store(engine: &Engine, memory_limit: usize) -> Result<Store<StoreLimits>, WasmError> {
     let limits = StoreLimitsBuilder::new().memory_size(memory_limit).build();
     let mut store = Store::new(engine, limits);
     store.limiter(|limits| limits);
     store
+        .set_fuel(DEFAULT_TASK_FUEL)
+        .map_err(|error| WasmError::Invalid(error.to_string()))?;
+    Ok(store)
 }
 
 #[cfg(test)]
@@ -209,6 +222,25 @@ mod tests {
             .invoke_with_limit("run", &[0; 65], 64)
             .unwrap_err();
         assert!(error.to_string().contains("input exceeds"));
+    }
+
+    #[test]
+    fn infinite_loop_is_stopped_by_fuel_limit() {
+        let bytes = wat::parse_str(
+            r#"
+            (module
+                (func (export "run") (param i32) (result i32)
+                    (loop $forever
+                        br $forever)
+                    i32.const 0))
+            "#,
+        )
+        .unwrap();
+        let error = PureI32Module::parse(&bytes)
+            .unwrap()
+            .invoke("run", 0)
+            .unwrap_err();
+        assert!(matches!(error, WasmError::Trap(_)));
     }
 
     #[test]

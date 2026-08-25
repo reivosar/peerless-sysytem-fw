@@ -1,8 +1,8 @@
 use futures::StreamExt;
 use libp2p::{
-    autonat, dcutr, gossipsub, identify,
+    autonat, connection_limits, dcutr, gossipsub, identify,
     identity::Keypair,
-    kad, mdns, noise, ping, relay, request_response,
+    kad, noise, ping, relay, request_response,
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
 };
@@ -26,6 +26,7 @@ struct RelayOnlyBehaviour {
     ping: ping::Behaviour,
     identify: identify::Behaviour,
     relay: relay::Behaviour,
+    limits: connection_limits::Behaviour,
 }
 
 /// A dedicated circuit-relay v2 service. It intentionally has no relay-client
@@ -60,6 +61,7 @@ impl CircuitRelay {
                         ping: ping::Behaviour::new(ping::Config::new()),
                         identify: identify::Behaviour::new(identify::Config::new("/peerless-relay/1".into(), relay_public_key)),
                         relay: relay::Behaviour::new(peer_id, relay::Config::default()),
+                        limits: bounded_connections(),
                     })
                     .expect("relay behaviour creation failed")
                     .build();
@@ -113,15 +115,15 @@ impl Drop for CircuitRelay {
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    mdns: Toggle<mdns::tokio::Behaviour>,
     rpc: request_response::cbor::Behaviour<SignedEnvelope, SignedEnvelope>,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     gossip: gossipsub::Behaviour,
-    identify: identify::Behaviour,
+    identify: Toggle<identify::Behaviour>,
     autonat: Toggle<autonat::Behaviour>,
-    dcutr: dcutr::Behaviour,
+    dcutr: Toggle<dcutr::Behaviour>,
     ping: ping::Behaviour,
     relay: relay::client::Behaviour,
+    limits: connection_limits::Behaviour,
 }
 
 enum Command {
@@ -167,6 +169,18 @@ pub struct P2pRpc {
     listen_addresses: Arc<RwLock<Vec<Multiaddr>>>,
     connectivity: Arc<RwLock<ConnectivityStats>>,
     connection_errors: Arc<RwLock<Vec<String>>>,
+    relay_private: bool,
+    autonat_enabled: bool,
+    privacy_relays: Arc<RwLock<HashSet<PeerId>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivacyProfile {
+    pub relay_only: bool,
+    pub mdns_enabled: bool,
+    pub identify_enabled: bool,
+    pub autonat_enabled: bool,
+    pub dcutr_enabled: bool,
 }
 
 impl P2pRpc {
@@ -175,7 +189,15 @@ impl P2pRpc {
         listen_address: Multiaddr,
         handler: impl Fn(SignedEnvelope) -> SignedEnvelope + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        Self::start_client(keypair, listen_address, handler, true)
+        Self::start_bound(keypair, listen_address, move |_, request| handler(request))
+    }
+
+    pub fn start_bound(
+        keypair: Keypair,
+        listen_address: Multiaddr,
+        handler: impl Fn(PeerId, SignedEnvelope) -> SignedEnvelope + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        Self::start_client(keypair, listen_address, handler, true, false)
     }
 
     pub fn start_private(
@@ -183,14 +205,43 @@ impl P2pRpc {
         listen_address: Multiaddr,
         handler: impl Fn(SignedEnvelope) -> SignedEnvelope + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        Self::start_client(keypair, listen_address, handler, false)
+        Self::start_client(
+            keypair,
+            listen_address,
+            move |_, request| handler(request),
+            false,
+            false,
+        )
+    }
+
+    /// Starts a relay-only endpoint. LAN discovery, Identify, AutoNAT, and
+    /// DCUtR are disabled so the remote application peer is not given a direct
+    /// network address. The configured relay can still observe both endpoints.
+    pub fn start_relay_private(
+        keypair: Keypair,
+        listen_address: Multiaddr,
+        handler: impl Fn(SignedEnvelope) -> SignedEnvelope + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        Self::start_relay_private_bound(keypair, listen_address, move |_, request| handler(request))
+    }
+
+    pub fn start_relay_private_bound(
+        keypair: Keypair,
+        listen_address: Multiaddr,
+        handler: impl Fn(PeerId, SignedEnvelope) -> SignedEnvelope + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        if !is_loopback(&listen_address) {
+            return Err("relay-private mode requires a loopback-only base listener".into());
+        }
+        Self::start_client(keypair, listen_address, handler, false, true)
     }
 
     fn start_client(
         keypair: Keypair,
         listen_address: Multiaddr,
-        handler: impl Fn(SignedEnvelope) -> SignedEnvelope + Send + Sync + 'static,
-        mdns_enabled: bool,
+        handler: impl Fn(PeerId, SignedEnvelope) -> SignedEnvelope + Send + Sync + 'static,
+        autonat_enabled: bool,
+        relay_private: bool,
     ) -> Result<Self, String> {
         let peer_id = keypair.public().to_peer_id();
         let peers = Arc::new(RwLock::new(HashMap::<PeerId, Vec<Multiaddr>>::new()));
@@ -203,17 +254,18 @@ impl P2pRpc {
         let connectivity_for_task = Arc::clone(&connectivity);
         let connection_errors = Arc::new(RwLock::new(Vec::new()));
         let errors_for_task = Arc::clone(&connection_errors);
+        let privacy_relays = Arc::new(RwLock::new(HashSet::new()));
         let handler = Arc::new(handler);
         let (command, mut commands) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().expect("tokio runtime creation failed");
             runtime.block_on(async move {
-                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
-                    .expect("mDNS initialisation failed");
                 let rpc = request_response::cbor::Behaviour::new(
                     [(StreamProtocol::new("/peerless/rpc/1"), request_response::ProtocolSupport::Full)],
-                    request_response::Config::default().with_request_timeout(Duration::from_secs(5)),
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(5))
+                        .with_max_concurrent_streams(32),
                 );
                 let mut kad = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
                 kad.set_mode(Some(kad::Mode::Server));
@@ -237,6 +289,7 @@ impl P2pRpc {
                 let autonat = autonat::Behaviour::new(peer_id, autonat_config);
                 let dcutr = dcutr::Behaviour::new(peer_id);
                 let ping = ping::Behaviour::new(ping::Config::new());
+                let limits = bounded_connections();
                 let mut swarm = SwarmBuilder::with_existing_identity(keypair)
                     .with_tokio()
                     .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
@@ -244,7 +297,17 @@ impl P2pRpc {
                     .with_quic()
                     .with_relay_client(noise::Config::new, yamux::Config::default)
                     .expect("relay transport initialisation failed")
-                    .with_behaviour(|_, relay| Behaviour { mdns: Toggle::from(mdns_enabled.then_some(mdns)), rpc, kad, gossip, identify, autonat: Toggle::from(mdns_enabled.then_some(autonat)), dcutr, ping, relay })
+                    .with_behaviour(|_, relay| Behaviour {
+                        rpc,
+                        kad,
+                        gossip,
+                        identify: Toggle::from((!relay_private).then_some(identify)),
+                        autonat: Toggle::from((autonat_enabled && !relay_private).then_some(autonat)),
+                        dcutr: Toggle::from((!relay_private).then_some(dcutr)),
+                        ping,
+                        relay,
+                        limits,
+                    })
                     .expect("libp2p behaviour creation failed")
                     .build();
                 swarm.listen_on(listen_address).expect("QUIC listen failed");
@@ -290,19 +353,8 @@ impl P2pRpc {
                                 listen_for_task.write().expect("listen lock poisoned").push(address.clone());
                                 let _ = ready_tx.try_send(address);
                             }
-                            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(found))) => {
-                                for (peer, address) in found {
-                                    swarm.add_peer_address(peer, address.clone());
-                                    swarm.behaviour_mut().kad.add_address(&peer, address.clone());
-                                    peers_for_task.write().expect("peer lock poisoned").entry(peer).or_default().push(address);
-                                }
-                            }
-                            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(expired))) => {
-                                let mut known = peers_for_task.write().expect("peer lock poisoned");
-                                for (peer, address) in expired { if let Some(values) = known.get_mut(&peer) { values.retain(|value| value != &address); } }
-                            }
-                            SwarmEvent::Behaviour(BehaviourEvent::Rpc(request_response::Event::Message { message, .. })) => match message {
-                                request_response::Message::Request { request, channel, .. } => { let _ = swarm.behaviour_mut().rpc.send_response(channel, handler(request)); }
+                            SwarmEvent::Behaviour(BehaviourEvent::Rpc(request_response::Event::Message { peer, message, .. })) => match message {
+                                request_response::Message::Request { request, channel, .. } => { let _ = swarm.behaviour_mut().rpc.send_response(channel, handler(peer, request)); }
                                 request_response::Message::Response { request_id, response } => { if let Some(sender) = pending.remove(&request_id) { let _ = sender.send(Ok(response)); } }
                             },
                             SwarmEvent::Behaviour(BehaviourEvent::Rpc(request_response::Event::OutboundFailure { request_id, error, .. })) => { if let Some(sender) = pending.remove(&request_id) { let _ = sender.send(Err(error.to_string())); } }
@@ -372,6 +424,9 @@ impl P2pRpc {
             listen_addresses,
             connectivity,
             connection_errors,
+            relay_private,
+            autonat_enabled,
+            privacy_relays,
         })
     }
 
@@ -388,6 +443,11 @@ impl P2pRpc {
             .clone()
     }
     pub fn listen_on(&self, address: Multiaddr) -> Result<(), String> {
+        if self.relay_private && !self.uses_configured_circuit(&address) {
+            return Err(
+                "relay-private mode accepts listeners only through configured relays".into(),
+            );
+        }
         let (tx, rx) = std_mpsc::channel();
         self.command
             .send(Command::Listen(address, tx))
@@ -396,6 +456,20 @@ impl P2pRpc {
             .map_err(|error| error.to_string())?
     }
     pub fn dial(&self, address: Multiaddr) -> Result<(), String> {
+        if self.relay_private {
+            let relays = self
+                .privacy_relays
+                .read()
+                .expect("privacy relay lock poisoned");
+            let target = terminal_peer(&address);
+            let allowed_circuit =
+                circuit_relay(&address).is_some_and(|peer| relays.contains(&peer));
+            let allowed_relay =
+                !has_circuit(&address) && target.is_some_and(|peer| relays.contains(&peer));
+            if !allowed_circuit && !allowed_relay {
+                return Err("relay-private mode rejects direct peer dials".into());
+            }
+        }
         let (tx, rx) = std_mpsc::channel();
         self.command
             .send(Command::Dial(address, tx))
@@ -419,9 +493,51 @@ impl P2pRpc {
         self.peers.read().expect("peer lock poisoned").clone()
     }
     pub fn add_peer(&self, peer: PeerId, address: Multiaddr) -> Result<(), String> {
+        if self.relay_private && !self.uses_configured_circuit(&address) {
+            return Err(
+                "relay-private mode accepts peer addresses only through configured relays".into(),
+            );
+        }
         self.command
             .send(Command::AddPeer(peer, address))
             .map_err(|error| error.to_string())
+    }
+    pub fn configure_privacy_relay(&self, address: Multiaddr) -> Result<(), String> {
+        if !self.relay_private {
+            return Err("privacy relay can only be configured in relay-private mode".into());
+        }
+        if has_circuit(&address) {
+            return Err("privacy relay address must be a direct relay multiaddr".into());
+        }
+        let peer = terminal_peer(&address)
+            .ok_or_else(|| "privacy relay address must end in /p2p/PEER_ID".to_owned())?;
+        self.privacy_relays
+            .write()
+            .expect("privacy relay lock poisoned")
+            .insert(peer);
+        let (tx, rx) = std_mpsc::channel();
+        self.command
+            .send(Command::Dial(address, tx))
+            .map_err(|error| error.to_string())?;
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|error| error.to_string())?
+    }
+    fn uses_configured_circuit(&self, address: &Multiaddr) -> bool {
+        circuit_relay(address).is_some_and(|peer| {
+            self.privacy_relays
+                .read()
+                .expect("privacy relay lock poisoned")
+                .contains(&peer)
+        })
+    }
+    pub fn privacy_profile(&self) -> PrivacyProfile {
+        PrivacyProfile {
+            relay_only: self.relay_private,
+            mdns_enabled: false,
+            identify_enabled: !self.relay_private,
+            autonat_enabled: self.autonat_enabled && !self.relay_private,
+            dcutr_enabled: !self.relay_private,
+        }
     }
     pub fn load_peer_cache(&self, path: impl AsRef<Path>) -> Result<usize, String> {
         let path = path.as_ref();
@@ -518,6 +634,53 @@ impl P2pRpc {
     }
 }
 
+fn has_circuit(address: &Multiaddr) -> bool {
+    address
+        .iter()
+        .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2pCircuit))
+}
+
+fn circuit_relay(address: &Multiaddr) -> Option<PeerId> {
+    let mut preceding_peer = None;
+    for protocol in address.iter() {
+        match protocol {
+            libp2p::multiaddr::Protocol::P2p(peer) => preceding_peer = Some(peer),
+            libp2p::multiaddr::Protocol::P2pCircuit => return preceding_peer,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn bounded_connections() -> connection_limits::Behaviour {
+    connection_limits::Behaviour::new(
+        connection_limits::ConnectionLimits::default()
+            .with_max_pending_incoming(Some(32))
+            .with_max_pending_outgoing(Some(64))
+            .with_max_established_incoming(Some(128))
+            .with_max_established_outgoing(Some(128))
+            .with_max_established_per_peer(Some(4))
+            .with_max_established(Some(256)),
+    )
+}
+
+fn is_loopback(address: &Multiaddr) -> bool {
+    matches!(
+        address.iter().next(),
+        Some(libp2p::multiaddr::Protocol::Ip4(ip)) if ip.is_loopback()
+    ) || matches!(
+        address.iter().next(),
+        Some(libp2p::multiaddr::Protocol::Ip6(ip)) if ip.is_loopback()
+    )
+}
+
+fn terminal_peer(address: &Multiaddr) -> Option<PeerId> {
+    address.iter().last().and_then(|protocol| match protocol {
+        libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
+        _ => None,
+    })
+}
+
 impl Drop for P2pRpc {
     fn drop(&mut self) {
         let _ = self.command.send(Command::Shutdown);
@@ -562,26 +725,28 @@ mod tests {
     }
 
     #[test]
-    fn mdns_discovers_another_local_swarm() {
+    fn peers_require_an_explicit_bootstrap_address() {
         let root = tempfile::tempdir().unwrap();
         let first_identity =
-            NodeIdentity::load_or_generate(root.path().join("mdns-first")).unwrap();
+            NodeIdentity::load_or_generate(root.path().join("bootstrap-first")).unwrap();
         let second_identity =
-            NodeIdentity::load_or_generate(root.path().join("mdns-second")).unwrap();
+            NodeIdentity::load_or_generate(root.path().join("bootstrap-second")).unwrap();
         let listen: Multiaddr = "/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap();
         let first =
             P2pRpc::start(first_identity.keypair(), listen.clone(), |request| request).unwrap();
         let second = P2pRpc::start(second_identity.keypair(), listen, |request| request).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if first.peers().contains_key(&second.peer_id())
-                && second.peers().contains_key(&first.peer_id())
-            {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(first.peers().is_empty());
+        assert!(second.peers().is_empty());
+        first
+            .add_peer(second.peer_id(), second.listen_address().clone())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !first.peers().contains_key(&second.peer_id()) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("mDNS did not discover both local swarms");
+        assert!(first.peers().contains_key(&second.peer_id()));
     }
 
     #[test]
@@ -787,5 +952,113 @@ mod tests {
             first.connectivity_stats(),
             second.connectivity_stats()
         );
+    }
+
+    #[test]
+    fn relay_private_mode_disables_address_discovery_and_rejects_direct_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::load_or_generate(root.path().join("private-mode")).unwrap();
+        let other = NodeIdentity::load_or_generate(root.path().join("other")).unwrap();
+        assert!(P2pRpc::start_relay_private(
+            identity.keypair(),
+            "/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap(),
+            |request| request,
+        )
+        .is_err());
+        let network = P2pRpc::start_relay_private(
+            identity.keypair(),
+            "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+            |request| request,
+        )
+        .unwrap();
+        assert_eq!(
+            network.privacy_profile(),
+            PrivacyProfile {
+                relay_only: true,
+                mdns_enabled: false,
+                identify_enabled: false,
+                autonat_enabled: false,
+                dcutr_enabled: false,
+            }
+        );
+        let direct: Multiaddr = "/ip4/127.0.0.1/udp/9999/quic-v1".parse().unwrap();
+        assert!(network
+            .add_peer(other.keypair().public().to_peer_id(), direct.clone())
+            .is_err());
+        assert!(network.listen_on(direct.clone()).is_err());
+        let direct_dial: Multiaddr =
+            format!("{direct}/p2p/{}", other.keypair().public().to_peer_id())
+                .parse()
+                .unwrap();
+        assert!(network.dial(direct_dial).is_err());
+        let unconfigured_circuit: Multiaddr = format!(
+            "{direct}/p2p/{}/p2p-circuit",
+            other.keypair().public().to_peer_id()
+        )
+        .parse()
+        .unwrap();
+        assert!(network.listen_on(unconfigured_circuit.clone()).is_err());
+        assert!(network
+            .add_peer(other.keypair().public().to_peer_id(), unconfigured_circuit)
+            .is_err());
+    }
+
+    #[test]
+    fn relay_private_rpc_never_upgrades_to_a_direct_connection() {
+        let root = tempfile::tempdir().unwrap();
+        let relay_identity =
+            NodeIdentity::load_or_generate(root.path().join("privacy-relay")).unwrap();
+        let private_identity =
+            NodeIdentity::load_or_generate(root.path().join("privacy-private")).unwrap();
+        let caller_identity =
+            NodeIdentity::load_or_generate(root.path().join("privacy-caller")).unwrap();
+        let tcp: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        let relay = CircuitRelay::start(relay_identity.keypair(), tcp.clone()).unwrap();
+        let private =
+            P2pRpc::start_relay_private(private_identity.keypair(), tcp.clone(), |mut request| {
+                request.payload.extend_from_slice(b"-private");
+                request
+            })
+            .unwrap();
+        let caller =
+            P2pRpc::start_relay_private(caller_identity.keypair(), tcp, |request| request).unwrap();
+        let relay_address: Multiaddr =
+            format!("{}/p2p/{}", relay.listen_address(), relay.peer_id())
+                .parse()
+                .unwrap();
+        private
+            .configure_privacy_relay(relay_address.clone())
+            .unwrap();
+        caller
+            .configure_privacy_relay(relay_address.clone())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let reservation: Multiaddr = format!("{relay_address}/p2p-circuit").parse().unwrap();
+        private.listen_on(reservation.clone()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && relay.reservations() == 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(relay.reservations(), 1);
+        let destination: Multiaddr = format!("{reservation}/p2p/{}", private.peer_id())
+            .parse()
+            .unwrap();
+        caller
+            .add_peer(private.peer_id(), destination.clone())
+            .unwrap();
+        caller.dial(destination).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            caller
+                .request(private.peer_id(), envelope(b"rpc"))
+                .unwrap()
+                .payload,
+            b"rpc-private"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(caller.connectivity_stats().hole_punch_successes, 0);
+        assert_eq!(private.connectivity_stats().hole_punch_successes, 0);
+        assert!(!caller.privacy_profile().dcutr_enabled);
+        assert!(!private.privacy_profile().identify_enabled);
     }
 }

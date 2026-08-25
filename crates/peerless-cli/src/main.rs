@@ -29,13 +29,26 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut args = env::args().skip(1);
     match args.next().as_deref().unwrap_or("help") {
         "start" => {
-            let data = PathBuf::from(args.next().unwrap_or_else(|| "peerless-data".into()));
+            let first = args.next();
+            let unsafe_open = first.as_deref() == Some("--unsafe-open");
+            let data = PathBuf::from(if unsafe_open {
+                args.next().unwrap_or_else(|| "peerless-data".into())
+            } else {
+                first.unwrap_or_else(|| "peerless-data".into())
+            });
             let listen: Multiaddr = args
                 .next()
                 .unwrap_or_else(|| "/ip4/0.0.0.0/udp/9718/quic-v1".into())
                 .parse()?;
             let node = PeerlessNode::open(data)?;
-            let network = node.serve_p2p(listen)?;
+            if !node.has_membership() && !unsafe_open {
+                return Err("refusing open-admission listener: join a permissioned network first, or use --unsafe-open only on an isolated test network".into());
+            }
+            let network = if unsafe_open {
+                node.serve_p2p_unrestricted(listen)?
+            } else {
+                node.serve_p2p(listen)?
+            };
             println!(
                 "node     {}\npeer     {}\nlisten   {}",
                 node.node_id(),
@@ -51,6 +64,71 @@ fn run() -> Result<(), Box<dyn Error>> {
             let data = PathBuf::from(args.next().unwrap_or_else(|| "peerless-data".into()));
             println!("{}", PeerlessNode::open(data)?.node_id());
         }
+        "init" => {
+            let data = PathBuf::from(args.next().ok_or("usage: peerless init DATA NETWORK")?);
+            let network_id = args.next().ok_or("missing network id")?;
+            let node = PeerlessNode::open(data)?;
+            if node.has_membership() {
+                return Err("node already belongs to a network".into());
+            }
+            let invitation = node.issue_invitation(
+                network_id.clone(),
+                node.node_id().clone(),
+                vec!["*".into()],
+                None,
+                Vec::new(),
+            )?;
+            node.install_invitation(&invitation, now())?;
+            println!("initialised\t{}\nnetwork\t{network_id}", node.node_id());
+        }
+        "start-relayed" => {
+            let data = PathBuf::from(args.next().ok_or(
+                "usage: peerless start-relayed DATA RELAY_MULTIADDR [RELAY_MULTIADDR...]",
+            )?);
+            let relays = args
+                .map(|value| value.parse::<Multiaddr>())
+                .collect::<Result<Vec<_>, _>>()?;
+            if relays.is_empty()
+                || relays
+                    .iter()
+                    .any(|relay| !matches!(relay.iter().last(), Some(Protocol::P2p(_))))
+            {
+                return Err("provide one or more relay multiaddrs ending in /p2p/PEER_ID".into());
+            }
+            let node = PeerlessNode::open(data)?;
+            let network = node.serve_p2p_relay_private("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+            let mut reservations = Vec::new();
+            for relay in relays {
+                network.configure_privacy_relay(relay.clone())?;
+                let mut reservation = relay;
+                reservation.push(Protocol::P2pCircuit);
+                network.listen_on(reservation.clone())?;
+                reservations.push(reservation);
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while network.connectivity_stats().relay_reservations < reservations.len() as u64
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if network.connectivity_stats().relay_reservations < reservations.len() as u64 {
+                return Err("not every relay reservation was established".into());
+            }
+            println!(
+                "node     {}\npeer     {}\nlisten   {}\nprivacy  relay-only",
+                node.node_id(),
+                network.peer_id(),
+                reservations
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            loop {
+                thread::sleep(Duration::from_secs(30));
+                node.save_peer_cache(&network)?;
+            }
+        }
         "invite" => {
             let data = PathBuf::from(
                 args.next()
@@ -60,6 +138,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             let member: NodeId = args.next().ok_or("missing member NodeId")?.parse()?;
             let output = PathBuf::from(args.next().ok_or("missing output file")?);
             let issuer = PeerlessNode::open(data)?;
+            if issuer.membership_network_id().as_deref() != Some(network_id.as_str()) {
+                return Err("issuer must be an initialised member of the same network".into());
+            }
             let invitation = issuer.issue_invitation(
                 network_id,
                 member,
@@ -173,13 +254,23 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn run_task(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let (unsafe_open, args) = if args.first().is_some_and(|value| value == "--unsafe-open") {
+        (true, &args[1..])
+    } else {
+        (false, args.as_slice())
+    };
     if args.len() < 3 {
-        return Err("usage: peerless run DATA WASM INTEGER [MULTIADDR...]".into());
+        return Err("usage: peerless run [--unsafe-open] DATA WASM INTEGER [MULTIADDR...]".into());
     }
     let node = PeerlessNode::open(&args[0])?;
     let component = fs::read(&args[1])?;
     let input: i32 = args[2].parse()?;
-    let network = node.serve_p2p("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+    let listen = "/ip4/0.0.0.0/udp/0/quic-v1".parse()?;
+    let network = if unsafe_open {
+        node.serve_p2p_unrestricted(listen)?
+    } else {
+        node.serve_p2p(listen)?
+    };
     for value in &args[3..] {
         add_peer(&network, value)?;
     }
@@ -266,12 +357,13 @@ fn run_image_demo(data: PathBuf, count: usize) -> Result<(), Box<dyn Error>> {
     )?;
     fs::write(data.join("resize.wasm"), &component)?;
     let coordinator = PeerlessNode::open(data.join("coordinator"))?;
-    let coordinator_net = coordinator.serve_p2p("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+    let coordinator_net =
+        coordinator.serve_p2p_unrestricted("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
     let mut executors = Vec::new();
     let mut networks = Vec::new();
     for index in 0..2 {
         let node = PeerlessNode::open(data.join(format!("node-{index}")))?;
-        let network = node.serve_p2p("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+        let network = node.serve_p2p_unrestricted("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
         coordinator_net.add_peer(network.peer_id(), network.listen_address().clone())?;
         executors.push(node);
         networks.push(network);
@@ -378,7 +470,7 @@ fn add_peer(network: &P2pRpc, value: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn print_help() {
-    println!("peerless start [DATA] [QUIC_MULTIADDR]\npeerless identity [DATA]\npeerless invite DATA NETWORK MEMBER OUTPUT [BOOTSTRAP...]\npeerless join DATA INVITATION\npeerless qr INVITATION\npeerless peers [DATA]\npeerless status [DATA]\npeerless inspect peers|tasks|storage|ledger [DATA]\npeerless run DATA WASM INTEGER [QUIC_MULTIADDR/p2p/PEER_ID ...]\npeerless e2e-features [DATA]\npeerless demo-images [DATA] [COUNT]");
+    println!("peerless init DATA NETWORK\npeerless start [--unsafe-open] [DATA] [QUIC_MULTIADDR]\npeerless start-relayed DATA RELAY_MULTIADDR [RELAY_MULTIADDR...]\npeerless identity [DATA]\npeerless invite DATA NETWORK MEMBER OUTPUT [BOOTSTRAP...]\npeerless join DATA INVITATION\npeerless qr INVITATION\npeerless peers [DATA]\npeerless status [DATA]\npeerless inspect peers|tasks|storage|ledger [DATA]\npeerless run [--unsafe-open] DATA WASM INTEGER [QUIC_MULTIADDR/p2p/PEER_ID ...]\npeerless e2e-features [DATA]\npeerless demo-images [DATA] [COUNT]");
 }
 fn print_qr(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     let code = qrcode::QrCode::new(bytes)?;

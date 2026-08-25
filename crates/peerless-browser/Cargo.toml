@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libp2p = { version = "0.56.0", default-features = false }
 peerless-protocol = { path = "../peerless-protocol" }
 serde.workspace = true
 thiserror.workspace = true

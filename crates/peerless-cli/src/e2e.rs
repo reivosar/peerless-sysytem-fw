@@ -41,9 +41,9 @@ fn content_state_membership(root: &Path) -> E2eResult {
     let first = PeerlessNode::open(root.join("mesh-first"))?;
     let second = PeerlessNode::open(root.join("mesh-second"))?;
     let unauthorized = PeerlessNode::open(root.join("mesh-unauthorized"))?;
-    let first_net = first.serve_p2p(listen())?;
-    let second_net = second.serve_p2p(listen())?;
-    let unauthorized_net = unauthorized.serve_p2p(listen())?;
+    let first_net = first.serve_p2p_unrestricted(listen())?;
+    let second_net = second.serve_p2p_unrestricted(listen())?;
+    let unauthorized_net = unauthorized.serve_p2p_unrestricted(listen())?;
     connect(&first_net, &second_net)?;
     connect(&unauthorized_net, &second_net)?;
     first.peer_capability_p2p(&first_net, second_net.peer_id())?;
@@ -120,10 +120,10 @@ fn replication_repair(root: &Path) -> E2eResult {
     let b = PeerlessNode::open(root.join("repair-b"))?;
     let c = PeerlessNode::open(root.join("repair-c"))?;
     let d = PeerlessNode::open(root.join("repair-d"))?;
-    let owner_net = owner.serve_p2p(listen())?;
-    let b_net = b.serve_p2p(listen())?;
-    let c_net = c.serve_p2p(listen())?;
-    let d_net = d.serve_p2p(listen())?;
+    let owner_net = owner.serve_p2p_unrestricted(listen())?;
+    let b_net = b.serve_p2p_unrestricted(listen())?;
+    let c_net = c.serve_p2p_unrestricted(listen())?;
+    let d_net = d.serve_p2p_unrestricted(listen())?;
     for network in [&b_net, &c_net, &d_net] {
         owner_net.add_peer(network.peer_id(), network.listen_address().clone())?;
     }
@@ -194,8 +194,8 @@ fn bft_ledger_gossip(root: &Path) -> E2eResult {
     );
     consensus.finalize(&mut block, &approvals)?;
     first.append_ledger_block(block.clone(), &consensus)?;
-    let first_net = first.serve_p2p(listen())?;
-    let second_net = second.serve_p2p(listen())?;
+    let first_net = first.serve_p2p_unrestricted(listen())?;
+    let second_net = second.serve_p2p_unrestricted(listen())?;
     connect(&first_net, &second_net)?;
     first.peer_capability_p2p(&first_net, second_net.peer_id())?;
     first_net.subscribe("peerless/ledger/v1")?;

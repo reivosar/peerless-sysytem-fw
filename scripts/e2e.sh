@@ -62,6 +62,18 @@ service_for_node() {
 
 record 'phase=build action=compile-runtime'
 "${compose[@]}" run --rm dev cargo build -p peerless-cli
+record 'phase=secure-default action=reject-open-admission-listener'
+if denied_output="$("${compose[@]}" run --rm probe /target/debug/peerless start /tmp/no-membership /ip4/127.0.0.1/udp/0/quic-v1 2>&1)"; then
+  record 'security failure=open-admission-listener-started'
+  exit 1
+fi
+denied_summary="$(grep 'peerless: refusing open-admission listener' <<<"$denied_output" | tail -n 1 || true)"
+record "secure-default rejection=$denied_summary"
+if ! grep -q 'refusing open-admission listener' <<<"$denied_output"; then
+  record 'security failure=unexpected-open-admission-rejection'
+  exit 1
+fi
+record 'secure-default membership_required=true unsafe_open_explicit=true'
 record 'phase=containers action=start'
 "${compose[@]}" up -d --build node-a node-b node-c
 internal="$(docker network inspect -f '{{.Internal}}' "${project}_peerless")"
@@ -69,10 +81,26 @@ internal="$(docker network inspect -f '{{.Internal}}' "${project}_peerless")"
 record "network name=${project}_peerless internal=$internal external_access=false"
 for service in node-a node-b node-c; do
   wait_for_node "$service"
+  container="$("${compose[@]}" ps -q "$service")"
+  runtime_user="$(docker inspect -f '{{.Config.User}}' "$container")"
+  readonly_root="$(docker inspect -f '{{.HostConfig.ReadonlyRootfs}}' "$container")"
+  cap_drop="$(docker inspect -f '{{json .HostConfig.CapDrop}}' "$container")"
+  security_opt="$(docker inspect -f '{{json .HostConfig.SecurityOpt}}' "$container")"
+  pids_limit="$(docker inspect -f '{{.HostConfig.PidsLimit}}' "$container")"
+  memory_limit="$(docker inspect -f '{{.HostConfig.Memory}}' "$container")"
+  [[ "$runtime_user" == "10001:10001" ]]
+  [[ "$readonly_root" == "true" ]]
+  [[ "$cap_drop" == *'ALL'* ]]
+  [[ "$security_opt" == *'no-new-privileges:true'* ]]
+  [[ "$pids_limit" == "256" ]]
+  [[ "$memory_limit" == "2147483648" ]]
+  [[ "$("${compose[@]}" exec -T "$service" stat -c '%a' /data/identity)" == "700" ]]
+  [[ "$("${compose[@]}" exec -T "$service" stat -c '%a' /data/identity/key.protobuf)" == "600" ]]
   id="$(node_id "$service")"
   [[ -n "$id" ]]
   record "node service=$service id=$id"
 done
+record 'hardening user=10001:10001 read_only=true cap_drop=ALL no_new_privileges=true pids=256 memory=2GiB identity_dir=0700 identity_key=0600'
 
 peer_addresses=()
 for service in node-a node-b node-c; do
@@ -86,7 +114,7 @@ record 'phase=wasm action=build'
   --target wasm32-unknown-unknown --release
 
 record 'phase=p2p action=remote-execute input=21 expected=42'
-first_output="$("${compose[@]}" run --rm probe /target/debug/peerless run \
+first_output="$("${compose[@]}" run --rm probe /target/debug/peerless run --unsafe-open \
   /tmp/e2e-requester \
   /target/wasm32-unknown-unknown/release/double.wasm \
   21 "${peer_addresses[@]}")"
@@ -112,7 +140,7 @@ for service in node-a node-b node-c; do
     live_addresses+=("/ip4/$(node_ip "$service")/udp/9718/quic-v1/p2p/$(peer_id "$service")")
   fi
 done
-second_output="$("${compose[@]}" run --rm probe /target/debug/peerless run \
+second_output="$("${compose[@]}" run --rm probe /target/debug/peerless run --unsafe-open \
   /tmp/e2e-failover \
   /target/wasm32-unknown-unknown/release/double.wasm \
   21 "${live_addresses[@]}")"
@@ -148,7 +176,9 @@ done
 record 'phase=adversarial action=workspace-tests'
 "${compose[@]}" run --rm dev cargo fmt --all -- --check
 "${compose[@]}" run --rm dev cargo clippy --workspace --all-targets -- -D warnings
-"${compose[@]}" run --rm dev cargo test --workspace -- --test-threads=1
+"${compose[@]}" run --rm dev cargo test --workspace -j 1 -- --test-threads=1
+"${compose[@]}" run --rm dev cargo audit \
+  --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
 "${compose[@]}" run --rm dev cargo check -p peerless-browser --target wasm32-unknown-unknown
 
-record 'result=PASS server_free=true runtime_network_internal=true falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true'
+record 'result=PASS server_free=true runtime_network_internal=true secure_default=true relay_privacy=true wasm_fuel=true rate_limit=true connection_limit=true key_permissions=true container_hardened=true falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true'
