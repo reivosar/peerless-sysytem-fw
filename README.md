@@ -55,6 +55,27 @@ runtime.
 | Audit history may be rewritten | Signed events, Merkle roots, hash chain, quorum finality |
 | Open admission enables Sybil attacks | Signed membership certificates and permissions |
 
+## Public-source security rule
+
+Peerless assumes that attackers can read, copy, compile, modify, and analyze the
+entire repository and every published binary. No security claim may depend on
+source secrecy, obfuscation, a hidden algorithm, an embedded key, or an
+undocumented fallback. Modified clients receive no authority unless receiving
+nodes can verify the required signatures, membership or anonymous capability,
+protocol state, and resource bounds.
+
+Operational security comes from runtime-generated private keys, short-lived
+ephemeral secrets, reviewed public cryptographic protocols, strict
+authorization, and fail-closed verification. Reading source code is not the
+same as compromising a running host: a host administrator who can read process
+memory or private key files is outside an in-process protocol's protection.
+
+The normative threat model and cryptographic design for the planned anonymous
+data plane are in
+[ADR 0001](docs/adr/0001-anonymous-p2p-threat-model.md). The currently shipped
+`start-relayed` profile provides relay-only source-IP privacy; it is not the
+anonymous profile described by that ADR.
+
 ## Architecture
 
 ~~~mermaid

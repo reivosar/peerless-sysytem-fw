@@ -19,6 +19,9 @@ record() {
   printf '%s\n' "$*" | tee -a "$evidence"
 }
 
+record 'phase=public-source-security action=reject-embedded-operational-secrets'
+bash scripts/check-public-source-security.sh | tee -a "$evidence"
+
 wait_for_node() {
   local service="$1"
   local attempt

@@ -1,5 +1,26 @@
 # Security and privacy
 
+## Public-source security principle
+
+Assume that an attacker knows the complete source, wire formats, dependencies,
+build artifacts, configuration schema, and tests. Peerless must not rely on
+obfuscation, hidden algorithms, embedded secrets, fixed keys, secret salts, or
+undocumented privileged paths. Repository access alone must not permit
+impersonation, decryption, forgery, authorization bypass, or privacy downgrade.
+
+Secrets are generated at runtime and kept outside the source tree. Every
+authorization decision is verified by the receiving node, so modifying a local
+client does not grant additional permission. This rule protects against source
+disclosure, not compromise of a running host that can read its private files or
+process memory.
+
+The normative anonymous-network threat model, role visibility matrix,
+cryptographic choices, fail-closed rules, rejected alternatives, and
+verification plan are in
+[ADR 0001](docs/adr/0001-anonymous-p2p-threat-model.md). That anonymous profile
+is planned work tracked by GitHub issues #9–#20; the implemented relay-only
+profile below must not be described as anonymous routing.
+
 ## Supported deployment profile
 
 Peerless is designed for permissioned meshes. A node must be initialised with
