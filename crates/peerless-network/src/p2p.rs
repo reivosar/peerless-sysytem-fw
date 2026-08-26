@@ -174,7 +174,7 @@ enum Command {
     Shutdown,
     Listen(Multiaddr, std_mpsc::Sender<Result<(), String>>),
     Dial(Multiaddr, std_mpsc::Sender<Result<(), String>>),
-    AddPeer(PeerId, Multiaddr),
+    AddPeer(PeerId, Multiaddr, std_mpsc::Sender<Result<(), String>>),
     Request(
         PeerId,
         SignedEnvelope,
@@ -225,6 +225,9 @@ pub struct PrivacyProfile {
     pub identify_enabled: bool,
     pub autonat_enabled: bool,
     pub dcutr_enabled: bool,
+    pub direct_peer_addresses_disclosed: bool,
+    pub persistent_peer_id_disclosed: bool,
+    pub exact_capability_metrics_disclosed: bool,
 }
 
 impl P2pRpc {
@@ -370,10 +373,11 @@ impl P2pRpc {
                                 let result = swarm.dial(address).map_err(|error| error.to_string());
                                 let _ = response.send(result);
                             }
-                            Command::AddPeer(peer, address) => {
+                            Command::AddPeer(peer, address, response) => {
                                 swarm.add_peer_address(peer, address.clone());
                                 swarm.behaviour_mut().kad.add_address(&peer, address.clone());
                                 peers_for_task.write().expect("peer lock poisoned").entry(peer).or_default().push(address);
+                                let _ = response.send(Ok(()));
                             }
                             Command::Request(peer, envelope, response) => {
                                 let id = swarm.behaviour_mut().rpc.send_request(&peer, envelope);
@@ -554,9 +558,12 @@ impl P2pRpc {
                 "relay-private mode accepts peer addresses only through configured relays".into(),
             );
         }
+        let (tx, rx) = std_mpsc::channel();
         self.command
-            .send(Command::AddPeer(peer, address))
-            .map_err(|error| error.to_string())
+            .send(Command::AddPeer(peer, address, tx))
+            .map_err(|error| error.to_string())?;
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|error| error.to_string())?
     }
     pub fn configure_privacy_relay(&self, address: Multiaddr) -> Result<(), String> {
         if !self.relay_private {
@@ -593,6 +600,9 @@ impl P2pRpc {
             identify_enabled: !self.relay_private,
             autonat_enabled: self.autonat_enabled && !self.relay_private,
             dcutr_enabled: !self.relay_private,
+            direct_peer_addresses_disclosed: !self.relay_private,
+            persistent_peer_id_disclosed: true,
+            exact_capability_metrics_disclosed: false,
         }
     }
     pub fn load_peer_cache(&self, path: impl AsRef<Path>) -> Result<usize, String> {
@@ -786,6 +796,10 @@ mod tests {
         let first =
             P2pRpc::start(first_identity.keypair(), listen.clone(), |request| request).unwrap();
         let second = P2pRpc::start(second_identity.keypair(), listen, |request| request).unwrap();
+        let direct_privacy = second.privacy_profile();
+        assert!(direct_privacy.direct_peer_addresses_disclosed);
+        assert!(direct_privacy.persistent_peer_id_disclosed);
+        assert!(!direct_privacy.exact_capability_metrics_disclosed);
         second
             .add_peer(first.peer_id(), first.listen_address().clone())
             .unwrap();
@@ -1052,6 +1066,9 @@ mod tests {
                 identify_enabled: false,
                 autonat_enabled: false,
                 dcutr_enabled: false,
+                direct_peer_addresses_disclosed: false,
+                persistent_peer_id_disclosed: true,
+                exact_capability_metrics_disclosed: false,
             }
         );
         let direct: Multiaddr = "/ip4/127.0.0.1/udp/9999/quic-v1".parse().unwrap();

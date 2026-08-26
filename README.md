@@ -43,7 +43,9 @@ runtime.
 | Nodes appear and disappear | Signed invitations, explicit bootstrap, peer cache, TTLs, leases |
 | WAN peers and content are hard to locate | Kademlia routing and provider discovery |
 | NAT prevents direct connectivity | AutoNAT, Circuit Relay v2, and DCUtR |
-| Placement becomes centralized | Per-requester adaptive scheduler |
+| Placement becomes centralized | Per-requester fair ordering and blind executor admission |
+| Host metrics reveal a participant's machine | Blind signed task admission; exact capability values remain local |
+| One task cannot use several machines | Bounded input shards execute concurrently across distinct peer memory domains |
 | Remote code may be hostile | Wasmtime sandbox with no ambient host imports |
 | Immutable data needs location-independent names | SHA-256 content-addressed storage |
 | One storage peer may disappear | Replica liveness checks and automatic target repair |
@@ -64,12 +66,14 @@ flowchart TB
     API --> AUDIT[Ledger API]
     CONTENT --> CAS[Verified filesystem CAS]
     STATE --> CRDT[Automerge CRDT]
-    COMPUTE --> SCHED[Adaptive scheduler]
+    COMPUTE --> SCHED[Blind admission scheduler]
+    COMPUTE --> SHARD[Parallel shard executor]
     COMPUTE --> WASM[Wasmtime executor]
     AUDIT --> LEDGER[Signed Merkle hash-chain ledger]
     CAS --> REPL[Replication policy]
     CRDT --> GOSSIP[Gossipsub]
     SCHED --> CAP[Capability and reputation view]
+    SHARD --> MESH
     LEDGER --> QUORUM[Membership and quorum]
     REPL --> MESH[P2P mesh]
     GOSSIP --> MESH
@@ -181,14 +185,12 @@ sequenceDiagram
     participant D as DHT and CAS
     participant E as Executor
     participant L as Ledger
-    R->>E: signed GetCapability
-    E-->>R: signed Capability with TTL
-    R->>R: constraints and adaptive score
+    R->>R: fair peer order from local assignment history
     R->>D: find component and input providers
     D-->>R: hash-verified CAS bytes
     R->>E: ContentStart, hash-checked ContentChunks, ContentComplete
-    R->>E: signed TaskOffer with lease
-    E->>E: recheck resources, deadline, membership
+    R->>E: signed TaskOffer with requirements and lease
+    E->>E: privately check local resources, deadline, membership
     E-->>R: TaskAccept
     R->>E: TaskCommit
     E->>E: execute sandboxed WASM
@@ -207,13 +209,25 @@ of the wire protocol.
 
 ## Resource and memory model
 
-Nodes do not expose a cross-machine shared address space. They advertise
-available CPU, memory, storage, runtime support, load, power, task slots, and
-expiry. Memory is pooled at the scheduling level: a task is placed on a node
-with enough local RAM. Both requester and executor enforce the minimum.
+Nodes do not expose unsafe cross-machine pointers or a transparent shared
+address space. Exact CPU, memory, storage, runtime inventory, load, power, and
+slot values stay local. A wire `GetCapability` response is deliberately
+redacted; placement does not consume it. The requester orders peers using only
+its local assignment history and submits a concrete signed `TaskOffer`. Each
+executor evaluates the requirements against its private current capacity and
+returns only accept or reject.
+
+Memory is pooled through bounded data-parallel execution. The
+`execute_sharded_bytes` API splits one application input into independently
+addressed shards, runs one shard per peer concurrently in each wave, preserves
+result order, and retries a departed executor on another peer. The aggregate
+working set can therefore span several isolated peer RAM domains without
+making one machine's pointers accessible to another. Applications define how
+shard outputs are reduced; this is a task/data pool, not distributed virtual
+memory.
 
 The native executor keeps 1 GiB of currently available host memory outside its
-advertised capacity. A task reserves one execution slot and an enforceable
+private admission capacity. A task reserves one execution slot and an enforceable
 memory budget when its offer is accepted; that reservation remains visible in
 capabilities while pending and running and is released after completion,
 failure, cancellation, or lease expiry. The default task budget is 64 MiB and
@@ -238,12 +252,11 @@ reject the reservation without allocating attacker-controlled chunk tables.
 Hard constraints reject stale or incompatible candidates before scoring:
 memory, storage, runtime, slots, deadline, and membership/security policy.
 
-The adaptive score considers CPU, memory, latency, power, locality, transfer
-cost, load, historical success, local reputation, congestion, and replication
-availability. Eligible remote candidates are considered first; self is used
-only when no remote candidate satisfies the hard constraints. Per-requester
-weighted assignment history spreads short sequential tasks across peers even
-before operating-system load metrics have time to change.
+Remote placement uses blind admission. The requester fairly orders connected
+peers from local assignment history; each executor applies CPU, memory,
+storage, runtime, slot, deadline, and membership constraints without disclosing
+the underlying host measurements. Rejected or departed peers are skipped and
+local execution remains the final availability fallback.
 
 Verification policies:
 

@@ -166,6 +166,9 @@ pub enum TaskState {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Exact values are a local scheduling/admission view. Native nodes redact all
+/// resource fields before returning this legacy shape over the wire; remote
+/// placement relies on signed TaskOffer acceptance rather than these values.
 pub struct NodeCapability {
     pub node: NodeId,
     pub cpu_cores: u16,

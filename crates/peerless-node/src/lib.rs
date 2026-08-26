@@ -2,7 +2,6 @@ use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use peerless_compute::{
     eligible, task_memory_limit, verify_outputs,
     wasm::{PureBytesModule, PureI32Module, WasmError},
-    PlacementCandidate, PlacementObservation, PlacementWeights, Scheduler,
 };
 use peerless_core::{ContentId, NodeCapability, NodeId, PowerState, ReplicationPolicy, Task};
 use peerless_identity::{IdentityError, NodeIdentity};
@@ -159,6 +158,13 @@ pub struct VerifiedExecution {
     pub executions: Vec<ExecutionRecord>,
 }
 #[derive(Clone, Debug)]
+pub struct DistributedExecution {
+    pub shards: Vec<ExecutionRecord>,
+    pub outputs: Vec<Vec<u8>>,
+    pub input_bytes: usize,
+    pub peak_shard_bytes: usize,
+}
+#[derive(Clone, Debug)]
 pub struct AuditProof {
     pub block_height: u64,
     pub event: SignedEvent,
@@ -241,6 +247,19 @@ impl ComputeApi<'_> {
         input: &[u8],
     ) -> Result<(ExecutionRecord, Vec<u8>), NodeError> {
         self.0.execute_local_bytes(task, component, input)
+    }
+
+    pub fn execute_sharded_bytes(
+        &self,
+        network: &P2pRpc,
+        peers: impl IntoIterator<Item = PeerId>,
+        task: Task,
+        component: &[u8],
+        input: &[u8],
+        shard_bytes: usize,
+    ) -> Result<DistributedExecution, NodeError> {
+        self.0
+            .execute_sharded_bytes_p2p(network, peers, task, component, input, shard_bytes)
     }
 }
 impl LedgerApi<'_> {
@@ -1130,7 +1149,7 @@ impl PeerlessNode {
                 task_id: String::new(),
                 reason: "content not found".into(),
             },
-            Message::GetCapability => Message::Capability(self.capability()),
+            Message::GetCapability => Message::Capability(self.public_capability()),
             Message::StateSnapshot { document, snapshot } => {
                 self.inner.state.merge_snapshot(&document, &snapshot)?;
                 Message::HasContent(ContentId::of(&snapshot))
@@ -1208,6 +1227,24 @@ impl PeerlessNode {
                 .saturating_sub(occupied_slots)
                 .min(u16::MAX as usize) as u16,
             expires_at: observed_at + 30_000,
+        }
+    }
+
+    /// A wire-safe liveness response. Exact host CPU, memory, storage, load,
+    /// power, runtime inventory, and slot counts stay local. Eligibility is
+    /// decided only when the peer submits a concrete signed TaskOffer.
+    fn public_capability(&self) -> NodeCapability {
+        NodeCapability {
+            node: self.node_id().clone(),
+            cpu_cores: 0,
+            available_cpu: 0.0,
+            available_memory: 0,
+            available_storage: 0,
+            runtimes: Vec::new(),
+            power: PowerState::Unknown,
+            load: 0.0,
+            task_slots: 0,
+            expires_at: now() + 30_000,
         }
     }
 
@@ -1497,10 +1534,16 @@ impl PeerlessNode {
         component: &[u8],
         input: i32,
     ) -> Result<(ExecutionRecord, Vec<u8>), NodeError> {
-        match self.select_best_executor(network, &task)? {
-            Some(peer) => self.remote_execute_p2p(network, peer, task, component, input),
-            None => self.execute_local(task, component, input),
+        let remote = self.ordered_remote_executors(network);
+        for peer in remote {
+            if let Ok(result) =
+                self.remote_execute_p2p(network, peer, task.clone(), component, input)
+            {
+                self.record_private_assignment(peer);
+                return Ok(result);
+            }
         }
+        self.execute_local(task, component, input)
     }
 
     pub fn execute_best_bytes(
@@ -1510,88 +1553,52 @@ impl PeerlessNode {
         component: &[u8],
         input: &[u8],
     ) -> Result<(ExecutionRecord, Vec<u8>), NodeError> {
-        match self.select_best_executor(network, &task)? {
-            Some(peer) => self.remote_execute_bytes_p2p(network, peer, task, component, input),
-            None => self.execute_local_bytes(task, component, input),
+        for peer in self.ordered_remote_executors(network) {
+            if let Ok(result) =
+                self.remote_execute_bytes_p2p(network, peer, task.clone(), component, input)
+            {
+                self.record_private_assignment(peer);
+                return Ok(result);
+            }
         }
+        self.execute_local_bytes(task, component, input)
     }
 
-    fn select_best_executor(
-        &self,
-        network: &P2pRpc,
-        task: &Task,
-    ) -> Result<Option<PeerId>, NodeError> {
-        let mut candidates = vec![(
-            None,
-            PlacementCandidate {
-                capability: self.capability(),
-                observation: PlacementObservation {
-                    locality: 1.0,
-                    ..Default::default()
-                },
-            },
-        )];
-        for peer in network.peers().keys().copied() {
-            if let Ok(capability) = self.peer_capability_p2p(network, peer) {
-                let reputation = self.peer_reputation(&capability.node).unwrap_or_default();
-                let total = reputation.success
-                    + reputation.failure
-                    + reputation.invalid_result
-                    + reputation.timeout;
-                candidates.push((
-                    Some(peer),
-                    PlacementCandidate {
-                        capability,
-                        observation: PlacementObservation {
-                            inverse_latency: if reputation.average_latency_ms > 0.0 {
-                                1.0 / (1.0 + reputation.average_latency_ms / 100.0)
-                            } else {
-                                0.5
-                            },
-                            historical_success: if total == 0 {
-                                0.5
-                            } else {
-                                reputation.success as f64 / total as f64
-                            },
-                            trust: reputation.trust_score(),
-                            ..Default::default()
-                        },
-                    },
-                ));
-            }
-        }
-        let views = candidates
-            .iter()
-            .map(|(_, candidate)| candidate.clone())
-            .collect::<Vec<_>>();
-        let selected = {
-            let mut assignments = self
-                .inner
-                .placement_counts
-                .lock()
-                .expect("placement history lock poisoned");
-            let selected = Scheduler::new(PlacementWeights::default())
-                .place_balanced_with_local_fallback(
-                    task,
-                    &views,
-                    self.node_id(),
-                    &assignments,
-                    now(),
+    fn private_peer_key(peer: PeerId) -> NodeId {
+        NodeId::derive(&peer.to_bytes())
+    }
+
+    fn ordered_remote_executors(&self, network: &P2pRpc) -> Vec<PeerId> {
+        let assignments = self
+            .inner
+            .placement_counts
+            .lock()
+            .expect("placement history lock poisoned");
+        let mut peers = network.peers().keys().copied().collect::<Vec<_>>();
+        peers.sort_by(|left, right| {
+            assignments
+                .get(&Self::private_peer_key(*left))
+                .copied()
+                .unwrap_or(0)
+                .cmp(
+                    &assignments
+                        .get(&Self::private_peer_key(*right))
+                        .copied()
+                        .unwrap_or(0),
                 )
-                .map_err(|error| NodeError::Rejected(error.to_string()))?;
-            if &selected.node != self.node_id() {
-                *assignments.entry(selected.node.clone()).or_insert(0) += 1;
-            }
-            selected
-        };
-        match candidates
-            .into_iter()
-            .find(|(_, candidate)| candidate.capability.node == selected.node)
-            .and_then(|(peer, _)| peer)
-        {
-            Some(peer) => Ok(Some(peer)),
-            None => Ok(None),
-        }
+                .then_with(|| left.to_bytes().cmp(&right.to_bytes()))
+        });
+        peers
+    }
+
+    fn record_private_assignment(&self, peer: PeerId) {
+        *self
+            .inner
+            .placement_counts
+            .lock()
+            .expect("placement history lock poisoned")
+            .entry(Self::private_peer_key(peer))
+            .or_insert(0) += 1;
     }
     pub fn execute_verified_p2p(
         &self,
@@ -1644,6 +1651,111 @@ impl PeerlessNode {
             executions: results.into_iter().map(|(record, _)| record).collect(),
         })
     }
+
+    /// Splits a byte input into independently bounded WASM tasks and executes
+    /// one shard per peer in each wave. This is the framework's distributed
+    /// memory model: no remote pointer is exposed, while the aggregate working
+    /// set may span the RAM of several mutually isolated executors.
+    pub fn execute_sharded_bytes_p2p(
+        &self,
+        network: &P2pRpc,
+        peers: impl IntoIterator<Item = PeerId>,
+        task: Task,
+        component: &[u8],
+        input: &[u8],
+        shard_bytes: usize,
+    ) -> Result<DistributedExecution, NodeError> {
+        let memory_limit = task_memory_limit(&task)
+            .ok_or_else(|| NodeError::Rejected("task memory limit is unsafe".into()))?;
+        if shard_bytes == 0 || shard_bytes as u64 > memory_limit {
+            return Err(NodeError::Rejected(
+                "shard size must be non-zero and fit the per-node task memory limit".into(),
+            ));
+        }
+        if ContentId::of(component) != task.component {
+            return Err(NodeError::Rejected(
+                "component bytes do not match the task ContentId".into(),
+            ));
+        }
+        let mut peers = peers.into_iter().collect::<Vec<_>>();
+        peers.sort_by_key(|peer| peer.to_bytes());
+        peers.dedup();
+        if peers.is_empty() {
+            return Err(NodeError::Rejected(
+                "distributed execution requires at least one remote peer".into(),
+            ));
+        }
+        let chunks = if input.is_empty() {
+            vec![input]
+        } else {
+            input.chunks(shard_bytes).collect::<Vec<_>>()
+        };
+        let mut records = Vec::with_capacity(chunks.len());
+        let mut outputs = Vec::with_capacity(chunks.len());
+        for (wave, batch) in chunks.chunks(peers.len()).enumerate() {
+            let results = std::thread::scope(|scope| {
+                batch
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, shard)| {
+                        let peer = peers[offset];
+                        let mut shard_task = task.clone();
+                        let index = wave * peers.len() + offset;
+                        shard_task.task_id = format!("{}-shard-{index}", task.task_id);
+                        shard_task.input = ContentId::of(shard);
+                        scope.spawn(move || {
+                            let retry_task = shard_task.clone();
+                            (
+                                peer,
+                                retry_task,
+                                self.remote_execute_bytes_p2p(
+                                    network, peer, shard_task, component, shard,
+                                ),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().map_err(|_| {
+                            NodeError::Rejected("distributed executor thread panicked".into())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, NodeError>>()
+            })?;
+            for (offset, (initial_peer, shard_task, initial)) in results.into_iter().enumerate() {
+                let (record, output, used_peer) = match initial {
+                    Ok((record, output)) => (record, output, initial_peer),
+                    Err(initial_error) => {
+                        let mut recovered = None;
+                        for peer in peers.iter().copied().filter(|peer| *peer != initial_peer) {
+                            if let Ok((record, output)) = self.remote_execute_bytes_p2p(
+                                network,
+                                peer,
+                                shard_task.clone(),
+                                component,
+                                batch[offset],
+                            ) {
+                                recovered = Some((record, output, peer));
+                                break;
+                            }
+                        }
+                        recovered.ok_or(initial_error)?
+                    }
+                };
+                self.record_private_assignment(used_peer);
+                records.push(record);
+                outputs.push(output);
+            }
+        }
+        Ok(DistributedExecution {
+            shards: records,
+            outputs,
+            input_bytes: input.len(),
+            peak_shard_bytes: chunks.iter().map(|chunk| chunk.len()).max().unwrap_or(0),
+        })
+    }
+
     pub fn remote_execute_p2p(
         &self,
         network: &P2pRpc,
@@ -1652,30 +1764,25 @@ impl PeerlessNode {
         component: &[u8],
         input: i32,
     ) -> Result<(ExecutionRecord, Vec<u8>), NodeError> {
-        let observed_node = self
-            .peer_capability_p2p(network, peer)
-            .ok()
-            .map(|capability| capability.node);
         let started = std::time::Instant::now();
         let result = self.remote_execute_via(task, component, input, |envelope| {
             let response = network.request(peer, envelope).map_err(NodeError::P2p)?;
             Self::ensure_peer_identity(&response, peer)?;
             Ok(response)
         });
-        if let Some(node) = observed_node {
-            match &result {
-                Ok(_) => self
-                    .inner
-                    .metadata
-                    .record_success(&node, started.elapsed().as_secs_f64() * 1000.0)?,
-                Err(error) => {
-                    let text = error.to_string();
-                    self.inner.metadata.record_failure(
-                        &node,
-                        text.contains("invalid"),
-                        text.contains("timeout"),
-                    )?;
-                }
+        let private_peer = Self::private_peer_key(peer);
+        match &result {
+            Ok(_) => self
+                .inner
+                .metadata
+                .record_success(&private_peer, started.elapsed().as_secs_f64() * 1000.0)?,
+            Err(error) => {
+                let text = error.to_string();
+                self.inner.metadata.record_failure(
+                    &private_peer,
+                    text.contains("invalid"),
+                    text.contains("timeout"),
+                )?;
             }
         }
         result
@@ -1973,7 +2080,19 @@ mod tests {
         let capability = requester
             .peer_capability_p2p(&requester_network, executor_network.peer_id())
             .unwrap();
+        let private_capability = executor.capability();
+        assert!(private_capability.cpu_cores > 0);
+        assert!(!private_capability.runtimes.is_empty());
+        assert_ne!(capability, private_capability);
         assert_eq!(capability.node, *executor.node_id());
+        assert_eq!(capability.cpu_cores, 0);
+        assert_eq!(capability.available_cpu, 0.0);
+        assert_eq!(capability.available_memory, 0);
+        assert_eq!(capability.available_storage, 0);
+        assert!(capability.runtimes.is_empty());
+        assert_eq!(capability.power, PowerState::Unknown);
+        assert_eq!(capability.load, 0.0);
+        assert_eq!(capability.task_slots, 0);
         let replicated = requester.put(b"replicated content").unwrap();
         let replicas = requester
             .replicate_p2p(
@@ -2042,6 +2161,11 @@ mod tests {
             )
             .unwrap();
 
+        let redacted = requester
+            .peer_capability_p2p(&requester_network, executor_network.peer_id())
+            .unwrap();
+        assert!(!eligible(&task("privacy-probe"), &redacted, now()));
+
         let (record, output) = requester
             .execute_best(&requester_network, task("peer-first"), DOUBLE, 21)
             .unwrap();
@@ -2087,6 +2211,85 @@ mod tests {
         assert_eq!(first.ledger_height() + second.ledger_height(), 6);
         assert!(first.ledger_height() > 0);
         assert!(second.ledger_height() > 0);
+    }
+
+    #[test]
+    fn sharded_execution_uses_multiple_peer_memory_domains_without_host_disclosure() {
+        let root = tempfile::tempdir().unwrap();
+        let requester = PeerlessNode::open(root.path().join("shard-requester")).unwrap();
+        let first = PeerlessNode::open(root.path().join("shard-first")).unwrap();
+        let second = PeerlessNode::open(root.path().join("shard-second")).unwrap();
+        let listen: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
+        let requester_network = requester.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let first_network = first.serve_p2p_unrestricted(listen.clone()).unwrap();
+        let second_network = second.serve_p2p_unrestricted(listen).unwrap();
+        for network in [&first_network, &second_network] {
+            requester_network
+                .add_peer(network.peer_id(), network.listen_address().clone())
+                .unwrap();
+        }
+
+        let mut input = Vec::new();
+        input.extend_from_slice(&21i32.to_le_bytes());
+        input.extend_from_slice(&10i32.to_le_bytes());
+        let distributed = requester
+            .execute_sharded_bytes_p2p(
+                &requester_network,
+                [first_network.peer_id(), second_network.peer_id()],
+                task("distributed-memory"),
+                DOUBLE,
+                &input,
+                4,
+            )
+            .unwrap();
+        assert_eq!(distributed.input_bytes, 8);
+        assert_eq!(distributed.peak_shard_bytes, 4);
+        assert_eq!(distributed.outputs.len(), 2);
+        assert_eq!(distributed.outputs[0], 42i32.to_le_bytes());
+        assert_eq!(distributed.outputs[1], 20i32.to_le_bytes());
+        assert_eq!(
+            distributed
+                .shards
+                .iter()
+                .map(|record| record.executor.clone())
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+        assert_eq!(requester.ledger_height(), 0);
+        assert_eq!(first.ledger_height(), 1);
+        assert_eq!(second.ledger_height(), 1);
+
+        let departed = first_network.peer_id();
+        drop(first_network);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let recovered = requester
+            .execute_sharded_bytes_p2p(
+                &requester_network,
+                [departed, second_network.peer_id()],
+                task("distributed-memory-retry"),
+                DOUBLE,
+                &input,
+                4,
+            )
+            .unwrap();
+        assert_eq!(recovered.outputs[0], 42i32.to_le_bytes());
+        assert_eq!(recovered.outputs[1], 20i32.to_le_bytes());
+        assert!(recovered
+            .shards
+            .iter()
+            .all(|record| record.executor == *second.node_id()));
+
+        assert!(requester
+            .execute_sharded_bytes_p2p(
+                &requester_network,
+                [departed],
+                task("zero-shard"),
+                DOUBLE,
+                &input,
+                0,
+            )
+            .is_err());
     }
 
     #[test]

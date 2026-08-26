@@ -1,5 +1,4 @@
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
-use peerless_compute::{PlacementCandidate, PlacementObservation, PlacementWeights, Scheduler};
 use peerless_core::{
     ContentId, NetworkRequirement, NodeId, Requirements, RuntimeRequirement, Task,
     VerificationPolicy,
@@ -276,22 +275,13 @@ fn run_task(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     }
     let timestamp = now();
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut candidates = Vec::new();
-    while candidates.is_empty() && Instant::now() < deadline {
+    while network.peers().is_empty() && Instant::now() < deadline {
         if args.len() == 3 {
             thread::sleep(Duration::from_millis(250));
         }
-        for peer in network.peers().keys().copied() {
-            if let Ok(capability) = node.peer_capability_p2p(&network, peer) {
-                candidates.push((
-                    peer,
-                    PlacementCandidate {
-                        capability,
-                        observation: PlacementObservation::default(),
-                    },
-                ));
-            }
-        }
+    }
+    if network.peers().is_empty() {
+        return Err("no connected peer became available before the deadline".into());
     }
     let task = Task {
         task_id: format!("{}-{timestamp}", node.node_id()),
@@ -307,14 +297,7 @@ fn run_task(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         verification: VerificationPolicy::TrustExecutor,
         deadline: None,
     };
-    let views: Vec<_> = candidates.iter().map(|(_, value)| value.clone()).collect();
-    let selected = Scheduler::new(PlacementWeights::default()).place(&task, &views, timestamp)?;
-    let peer = candidates
-        .iter()
-        .find(|(_, value)| value.capability.node == selected.node)
-        .ok_or("selected peer disappeared")?
-        .0;
-    let (record, bytes) = node.remote_execute_p2p(&network, peer, task, &component, input)?;
+    let (record, bytes) = node.execute_best(&network, task, &component, input)?;
     let output = i32::from_le_bytes(bytes.try_into().map_err(|_| "invalid result")?);
     println!(
         "task      {}\nexecutor  {}\noutput    {} ({output})\nverified  true",
@@ -429,7 +412,7 @@ fn run_image_demo(data: PathBuf, count: usize) -> Result<(), Box<dyn Error>> {
         "distribution": distribution,
         "requester_executions": distribution[0],
         "requester_ledger_delta": ledger_height_deltas[0],
-        "placement": "peer-first weighted-fair Scheduler with local availability fallback",
+        "placement": "peer-first fair ordering with blind executor admission and local availability fallback",
         "component": "resize.wasm",
         "operation": "64x64 to 32x32 nearest-neighbour resize executed as WebAssembly",
         "verified_outputs": count,

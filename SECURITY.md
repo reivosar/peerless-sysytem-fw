@@ -48,6 +48,12 @@ that property.
   bounded pending/established connections, and per-peer connection limits.
 - Bounded content size, chunk size, concurrent uploads, in-flight bytes, and
   task slots.
+- Blind task admission: exact CPU, RAM, storage, runtime inventory, load,
+  power, and slot measurements are never returned over the wire. Signed
+  requesters learn only whether a concrete task is accepted or rejected.
+- Bounded parallel shard execution spreads application working sets across
+  isolated executors without exposing cross-host pointers or shared process
+  memory.
 - Bounded peer-cache, membership, CRDT, and ledger reads; peer-cache sequence
   decoding stops at its entry cap instead of allocating the full input.
 - Crash-safe atomic persistence with exclusive temporary files, `fsync`,
@@ -87,6 +93,13 @@ does not protect a node after host/root compromise, does not hide traffic from
 its configured relay or a global observer, and does not yet provide hardware-
 backed keys or an automated multi-party revocation ceremony. Security fixes in
 Rust, Wasmtime, libp2p, and transitive dependencies must be applied promptly.
+
+Signed application peers still see a persistent pseudonymous Node ID. Direct
+P2P peers necessarily see each other's network endpoint. Relay-only mode hides
+that endpoint from the other application peer, but the selected relay sees both
+ends. Blind admission prevents bulk capability disclosure; repeated real task
+offers can still reveal coarse facts through accept/reject outcomes and are
+therefore membership- and rate-limited.
 
 Report suspected vulnerabilities privately to the repository owner. Do not
 include live private keys, invitations, private addresses, or user data in a
