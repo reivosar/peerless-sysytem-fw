@@ -16,4 +16,4 @@ futures.workspace = true
 libp2p = { version = "0.56.0", default-features = false, features = ["cbor", "gossipsub", "identify", "macros", "noise", "request-response", "wasm-bindgen", "webrtc-websys", "websocket-websys", "webtransport-websys", "yamux"] }
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"
-getrandom = { version = "0.3.4", features = ["wasm_js"] }
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
