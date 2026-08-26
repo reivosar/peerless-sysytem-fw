@@ -3157,7 +3157,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "thiserror 1.0.56",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -3170,7 +3170,7 @@ dependencies = [
  "libp2p",
  "peerless-protocol",
  "serde",
- "thiserror 1.0.56",
+ "thiserror 2.0.20",
  "wasm-bindgen",
  "wasm-bindgen-futures",
 ]
@@ -3198,7 +3198,7 @@ version = "0.1.0"
 dependencies = [
  "peerless-core",
  "peerless-storage",
- "thiserror 1.0.56",
+ "thiserror 2.0.20",
  "wasmtime",
  "wat",
 ]
@@ -3210,7 +3210,7 @@ dependencies = [
  "hex",
  "serde",
  "sha2 0.10.9",
- "thiserror 1.0.56",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3220,7 +3220,7 @@ dependencies = [
  "libp2p",
  "peerless-core",
  "tempfile",
- "thiserror 1.0.56",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3235,7 +3235,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "thiserror 1.0.56",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3252,7 +3252,7 @@ dependencies = [
  "serde_json",
  "socket2 0.5.10",
  "tempfile",
- "thiserror 1.0.56",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -3273,7 +3273,7 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "tempfile",
- "thiserror 1.0.56",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3284,7 +3284,7 @@ dependencies = [
  "hex",
  "hkdf",
  "sha2 0.10.9",
- "thiserror 1.0.56",
+ "thiserror 2.0.20",
  "x25519-dalek",
  "zeroize",
 ]
@@ -3298,7 +3298,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.56",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3309,7 +3309,7 @@ dependencies = [
  "peerless-storage",
  "serde",
  "tempfile",
- "thiserror 1.0.56",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3318,7 +3318,7 @@ version = "0.1.0"
 dependencies = [
  "peerless-core",
  "tempfile",
- "thiserror 1.0.56",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3633,7 +3633,7 @@ dependencies = [
  "asynchronous-codec",
  "bytes",
  "quick-protobuf",
- "thiserror 1.0.56",
+ "thiserror 1.0.69",
  "unsigned-varint 0.8.0",
 ]
 
@@ -3851,7 +3851,7 @@ checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
 dependencies = [
  "getrandom 0.2.17",
  "libredox",
- "thiserror 1.0.56",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3962,7 +3962,7 @@ dependencies = [
  "netlink-proto",
  "netlink-sys",
  "nix",
- "thiserror 1.0.56",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -4456,11 +4456,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.56"
+version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d54378c645627613241d077a3a79db965db602882668f9136ac42af9ecb730ad"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
 dependencies = [
- "thiserror-impl 1.0.56",
+ "thiserror-impl 1.0.69",
 ]
 
 [[package]]
@@ -4474,9 +4474,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "1.0.56"
+version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa0faa943b50f3db30a20aa7e265dbc66076993efed8463e8de414e5d06d3471"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
 dependencies = [
  "proc-macro2",
  "quote",
