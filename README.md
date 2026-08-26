@@ -346,6 +346,7 @@ expiry before persisting membership and populating the peer cache.
 
 ~~~text
 crates/
+├── peerless-anonymous-auth blind RFC 9578 membership capabilities
 ├── peerless-core       domain types and policies
 ├── peerless-identity   persistent Ed25519 identity
 ├── peerless-network    libp2p discovery, DHT, gossip, transports, NAT

@@ -31,6 +31,22 @@ report_matches() {
   fi
 }
 
+report_rust_matches() {
+  local description="$1"
+  local pattern="$2"
+  local matches
+  matches="$(
+    while IFS= read -r -d '' path; do
+      [[ "$path" == *.rs ]] || continue
+      grep -n -I -H -E -- "$pattern" "$path" || true
+    done < <(source_files)
+  )"
+  if [[ -n "$matches" ]]; then
+    printf 'public-source security failure: %s\n%s\n' "$description" "$matches" >&2
+    failures=1
+  fi
+}
+
 # Build high-risk markers from fragments so this gate does not match its own
 # source. These are operational-secret formats, not public test-vector values.
 pem_begin='-----BEGIN '
@@ -70,8 +86,15 @@ fi
 deterministic_bypass='(ALLOW|ACCEPT|USE)_(FIXED|TEST|DETERMINISTIC)_(KEY|SECRET|TOKEN)'
 report_matches 'production secret-bypass shaped switch' "$deterministic_bypass"
 
+# RUSTSEC-2023-0071 affects the RustCrypto RSA private operation. The
+# privacypass dependency is restricted to client blinding/finalization and
+# public verification. Issuer private operations use OpenSSL. Keep that
+# reachability claim machine-enforced whenever source is public or modified.
+private_rsa_api='(IssuerServer|IssuerKeyStore|PrivateIssuerKeyPair|blind_sign\()'
+report_rust_matches 'forbidden RustCrypto private-RSA operation' "$private_rsa_api"
+
 if (( failures != 0 )); then
   exit 1
 fi
 
-printf 'public-source-security status=PASS tracked_operational_secrets=false hidden_key_bypass=false\n'
+printf 'public-source-security status=PASS tracked_operational_secrets=false hidden_key_bypass=false rustcrypto_private_rsa=false\n'

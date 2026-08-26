@@ -181,7 +181,7 @@ record 'phase=adversarial action=workspace-tests'
 "${compose[@]}" run --rm dev cargo clippy --workspace --all-targets -- -D warnings
 "${compose[@]}" run --rm dev cargo test --workspace -j 1 -- --test-threads=1
 "${compose[@]}" run --rm dev cargo audit \
-  --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
+  --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
 "${compose[@]}" run --rm dev cargo check -p peerless-browser --target wasm32-unknown-unknown
 
 record 'result=PASS server_free=true runtime_network_internal=true secure_default=true relay_privacy=true wasm_fuel=true rate_limit=true connection_limit=true key_permissions=true container_hardened=true falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true'

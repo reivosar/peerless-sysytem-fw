@@ -19,7 +19,10 @@ jobs:
       - run: cargo install cargo-audit --locked
       # libp2p 0.56 records its optional mDNS dependency in Cargo.lock even
       # though peerless does not enable or compile that feature.
-      - run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
+      # privacypass records RustCrypto rsa for public client/verifier math.
+      # Peerless performs no RustCrypto private RSA operation; the repository
+      # gate rejects those APIs, and issuer signing uses OpenSSL RSA blinding.
+      - run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
 
   test:
     runs-on: ubuntu-latest

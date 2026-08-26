@@ -1,0 +1,25 @@
+[package]
+name = "peerless-anonymous-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+hex.workspace = true
+openssl.workspace = true
+peerless-core = { path = "../peerless-core" }
+peerless-identity = { path = "../peerless-identity" }
+peerless-ledger = { path = "../peerless-ledger" }
+privacypass.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

@@ -248,6 +248,64 @@ baseline. Networks may approve multiple issuer keys through the existing
 governance ledger; runtime verification remains decentralized. Threshold
 issuance requires a separately reviewed standard and ADR amendment.
 
+#### Implementation record and security status
+
+Issue #11 is implemented in `peerless-anonymous-auth` with the RFC 9578 public
+token suite: RSA-2048, SHA-384, deterministic RSASSA-PSS encoding, and blind
+RSA issuance. Client blinding/finalization and verifier public-key operations
+use exactly `privacypass = 0.2.0-pre.3`. Issuer key generation and the private
+raw-RSA blind-signing operation use OpenSSL with RSA blinding. The
+`privacypass` source forbids unsafe Rust and contains public-token known-answer
+tests, including vectors cross-checked with a Go implementation. Its upstream
+repository explicitly states that the library has not received an independent
+professional audit. Peerless therefore treats this dependency and the
+anonymous profile as pre-stable until that review occurs; passing local tests
+is not represented as a cryptographic audit.
+
+`privacypass` currently records the RustCrypto `rsa` crate for its public and
+private modules. RustSec RUSTSEC-2023-0071 reports a timing side channel in
+that crate's private-key operations with no patched release. Peerless does not
+call or expose those private-key APIs: its repository gate rejects
+`IssuerServer`, `IssuerKeyStore`, private RustCrypto keypairs, and
+`blind_sign` in Rust source. RustCrypto is used only for public client and
+verifier mathematics, for which the advisory's key-recovery condition does
+not exist. The Security workflow's targeted advisory exception is conditional
+on that machine-enforced reachability rule. Removing the transitive RSA crate
+or moving to a patched upstream remains preferable when available.
+
+Peerless adds the application constraints that RFC 9578 intentionally leaves
+to deployments:
+
+- a separate issuer key is generated for each network, coarse permission,
+  epoch, and expiry class;
+- every scope-key descriptor is signed by an accountable control-plane issuer,
+  and each verifier checks that signature against its trusted issuer set before
+  accepting the key;
+- the SHA-256 key identifier is inside the public scope and the signed token
+  input, preventing a blind request authorized for one class from being
+  redeemed for another;
+- membership and finalized revocation are checked only during blind issuance;
+- the destination reconstructs and compares the complete challenge digest
+  before offline signature verification;
+- the RFC nonce is a one-use, scope-limited nullifier retained for a bounded
+  time and in a bounded store;
+- issuance counts are bounded per enrolled member and epoch at the issuer;
+- request, response, token, network, permission, key, descriptor, and parsing
+  sizes are bounded before allocation or cryptographic work; and
+- normal error values contain no member identity, token, nonce, key, or
+  issuance transcript, and `Debug` output redacts blind state, blind messages,
+  responses, and bearer-token bytes.
+
+Blind signing hides the token challenge from the issuer. Consequently, using
+one issuer key across permissions would allow a malicious client to request an
+authorized class while blinding a different class. Scope-specific epoch keys
+and exact key-to-scope verification are mandatory, not an optimization.
+
+The current issuer key store is process-local. Durable hardware-backed or
+encrypted issuer-key custody and explicit OpenSSL secure-heap/key-destruction
+review are required before operational deployment. This is an explicit
+residual host-compromise risk and part of the independent review gate.
+
 ### Circuit key establishment: anonymous initiator, authenticated relay
 
 Each approved relay descriptor carries a short-lived onion key separate from

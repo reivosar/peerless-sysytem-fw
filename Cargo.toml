@@ -11,6 +11,7 @@ members = [
     "crates/peerless-state",
     "crates/peerless-ledger",
     "crates/peerless-browser",
+    "crates/peerless-anonymous-auth",
 ]
 resolver = "2"
 exclude = ["examples/double-wasm"]
@@ -22,6 +23,7 @@ license = "Apache-2.0 OR MIT"
 rust-version = "1.94"
 
 [workspace.dependencies]
+async-trait = "0.1.89"
 hex = "0.4.3"
 futures = "0.3.31"
 automerge = "0.11.0"
@@ -37,4 +39,7 @@ tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "sync", "
 wasmtime = { version = "46.0.2", features = ["component-model"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 qrcode = { version = "0.14.1", default-features = false }
+openssl = "0.10.73"
+privacypass = "=0.2.0-pre.3"
+rand = { version = "0.10", features = ["sys_rng"] }
 wat = "1.245.1"
