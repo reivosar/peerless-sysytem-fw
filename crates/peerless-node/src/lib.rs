@@ -2300,8 +2300,7 @@ mod tests {
         let offered = task("reserved");
         executor.inner.cas.put(DOUBLE).unwrap();
         executor.inner.cas.put(&21i32.to_le_bytes()).unwrap();
-        let before = executor.capability();
-        assert_eq!(before.task_slots, 1);
+        assert_eq!(executor.capability().task_slots, 1);
 
         let offer = Message::TaskOffer {
             task: offered.clone(),
@@ -2316,13 +2315,15 @@ mod tests {
         assert!(matches!(response, Message::TaskAccept { .. }));
         let reserved = executor.capability();
         assert_eq!(reserved.task_slots, 0);
-        assert!(
-            reserved.available_memory
-                <= before
-                    .available_memory
-                    .saturating_sub(peerless_compute::DEFAULT_TASK_MEMORY_LIMIT)
-                    .saturating_add(8 * 1024 * 1024)
-        );
+        let reserved_memory = executor
+            .inner
+            .pending
+            .lock()
+            .expect("task lock poisoned")
+            .values()
+            .filter_map(|reservation| task_memory_limit(&reservation.task))
+            .sum::<u64>();
+        assert_eq!(reserved_memory, peerless_compute::DEFAULT_TASK_MEMORY_LIMIT);
 
         let retry = executor
             .handle(SignedEnvelope::seal(&offer, &requester).unwrap())
