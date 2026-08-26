@@ -1,0 +1,17 @@
+[package]
+name = "peerless-onion-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

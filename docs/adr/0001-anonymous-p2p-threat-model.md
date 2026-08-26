@@ -308,6 +308,25 @@ residual host-compromise risk and part of the independent review gate.
 
 ### Circuit key establishment: anonymous initiator, authenticated relay
 
+Issue #12 implements this cryptographic wire layer in
+`peerless-onion-protocol`; the exact v1 layouts, bounds, primitive selection,
+known-answer vector, and failure behavior are recorded in
+`docs/ONION-PROTOCOL.md`. Setup combines an initiator ephemeral-to-relay
+service-key X25519 result with an initiator-to-relay-session-ephemeral result.
+The HKDF transcript binds the expected relay service key and all public setup
+fields. A ChaCha20-Poly1305 confirmation proves possession of that service key.
+Governance signing and distribution of the public service-key descriptor is
+deliberately the route-governance responsibility in issue #15; accepting an
+unverified public key from the same transport would not authenticate a relay.
+
+Forward and reverse AEAD keys and nonce prefixes are independently derived.
+Sender objects own non-cloneable hop-key values and monotonically assign the
+sequence component of each nonce. Cells are exactly 1,024 bytes on every link;
+the terminal type and payload are encrypted, while authenticated compact inner
+layers are zero-padded back to the fixed link size after each relay removes
+exactly one layer. Bounded replay windows commit a sequence only after valid
+authentication. X25519 secrets and derived buffers use zeroizing types.
+
 Each approved relay descriptor carries a short-lived onion key separate from
 its governance identity. The circuit protocol will use a reviewed Noise
 handshake pattern with an anonymous ephemeral initiator and authenticated

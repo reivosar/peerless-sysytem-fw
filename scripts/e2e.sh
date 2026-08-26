@@ -176,6 +176,12 @@ for pass in $(seq 1 5); do
   grep -q 'result=PASS content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true' <<<"$features_output"
 done
 
+record 'phase=onion-falsification action=cryptographic-protocol-tests'
+for pass in $(seq 1 5); do
+  record "onion-falsification-pass=$pass"
+  "${compose[@]}" run --rm dev cargo test -p peerless-onion-protocol -- --test-threads=1
+done
+
 record 'phase=adversarial action=workspace-tests'
 "${compose[@]}" run --rm dev cargo fmt --all -- --check
 "${compose[@]}" run --rm dev cargo clippy --workspace --all-targets -- -D warnings
@@ -184,4 +190,4 @@ record 'phase=adversarial action=workspace-tests'
   --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
 "${compose[@]}" run --rm dev cargo check -p peerless-browser --target wasm32-unknown-unknown
 
-record 'result=PASS server_free=true runtime_network_internal=true secure_default=true relay_privacy=true wasm_fuel=true rate_limit=true connection_limit=true key_permissions=true container_hardened=true falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true'
+record 'result=PASS server_free=true runtime_network_internal=true secure_default=true relay_privacy=true onion_cells=true onion_falsification_passes=5 wasm_fuel=true rate_limit=true connection_limit=true key_permissions=true container_hardened=true falsification_passes=5 p2p=true remote_execution=true signature=true cas=true ledger=true departure=true restart=true content=true crdt=true membership=true replication=true repair=true bft=true ledger_gossip=true relay=true dcutr=true adversarial=true browser_build=true'

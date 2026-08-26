@@ -72,9 +72,12 @@ memory or private key files is outside an in-process protocol's protection.
 
 The normative threat model and cryptographic design for the planned anonymous
 data plane are in
-[ADR 0001](docs/adr/0001-anonymous-p2p-threat-model.md). The currently shipped
-`start-relayed` profile provides relay-only source-IP privacy; it is not the
-anonymous profile described by that ADR.
+[ADR 0001](docs/adr/0001-anonymous-p2p-threat-model.md). The implemented v1
+onion wire format, bounds, and test vector are in
+[`docs/ONION-PROTOCOL.md`](docs/ONION-PROTOCOL.md). These cryptographic
+primitives are not yet wired into the `start-relayed` profile; that profile
+still provides relay-only source-IP privacy and is not the completed anonymous
+profile described by the ADR.
 
 ## Architecture
 
@@ -347,6 +350,7 @@ expiry before persisting membership and populating the peer cache.
 ~~~text
 crates/
 ├── peerless-anonymous-auth blind RFC 9578 membership capabilities
+├── peerless-onion-protocol fixed-size layered AEAD cells and per-hop keys
 ├── peerless-core       domain types and policies
 ├── peerless-identity   persistent Ed25519 identity
 ├── peerless-network    libp2p discovery, DHT, gossip, transports, NAT

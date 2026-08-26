@@ -12,6 +12,7 @@ members = [
     "crates/peerless-ledger",
     "crates/peerless-browser",
     "crates/peerless-anonymous-auth",
+    "crates/peerless-onion-protocol",
 ]
 resolver = "2"
 exclude = ["examples/double-wasm"]
@@ -24,7 +25,9 @@ rust-version = "1.94"
 
 [workspace.dependencies]
 async-trait = "0.1.89"
+chacha20poly1305 = "0.10.1"
 hex = "0.4.3"
+hkdf = "0.12.4"
 futures = "0.3.31"
 automerge = "0.11.0"
 libp2p = { version = "0.56.0", features = ["autonat", "cbor", "dcutr", "gossipsub", "identify", "kad", "macros", "noise", "ping", "quic", "relay", "request-response", "tcp", "tokio", "yamux"] }
@@ -43,3 +46,5 @@ openssl = "0.10.73"
 privacypass = "=0.2.0-pre.3"
 rand = { version = "0.10", features = ["sys_rng"] }
 wat = "1.245.1"
+x25519-dalek = { version = "2.0.1", features = ["getrandom", "reusable_secrets", "static_secrets", "zeroize"] }
+zeroize = "1.8.1"

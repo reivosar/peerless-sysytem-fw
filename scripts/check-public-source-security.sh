@@ -47,6 +47,23 @@ report_rust_matches() {
   fi
 }
 
+report_onion_metadata_matches() {
+  local matches
+  matches="$(
+    while IFS= read -r -d '' path; do
+      [[ "$path" == crates/peerless-onion-protocol/src/*.rs ]] || continue
+      grep -n -I -H -E -- \
+        '(NodeId|NodeIdentity|PeerId|Membership|Multiaddr|SocketAddr|IpAddr|public_key_der)' \
+        "$path" || true
+    done < <(source_files)
+  )"
+  if [[ -n "$matches" ]]; then
+    printf 'public-source security failure: stable identity or direct address in onion wire crate\n%s\n' \
+      "$matches" >&2
+    failures=1
+  fi
+}
+
 # Build high-risk markers from fragments so this gate does not match its own
 # source. These are operational-secret formats, not public test-vector values.
 pem_begin='-----BEGIN '
@@ -93,8 +110,12 @@ report_matches 'production secret-bypass shaped switch' "$deterministic_bypass"
 private_rsa_api='(IssuerServer|IssuerKeyStore|PrivateIssuerKeyPair|blind_sign\()'
 report_rust_matches 'forbidden RustCrypto private-RSA operation' "$private_rsa_api"
 
+# Anonymous onion wire types must remain structurally unable to serialize a
+# stable framework identity, membership proof, or direct network address.
+report_onion_metadata_matches
+
 if (( failures != 0 )); then
   exit 1
 fi
 
-printf 'public-source-security status=PASS tracked_operational_secrets=false hidden_key_bypass=false rustcrypto_private_rsa=false\n'
+printf 'public-source-security status=PASS tracked_operational_secrets=false hidden_key_bypass=false rustcrypto_private_rsa=false onion_stable_metadata=false\n'
